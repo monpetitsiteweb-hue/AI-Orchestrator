@@ -1,0 +1,67 @@
+name: Orchestrator Plan Intake
+
+on:
+  repository_dispatch:
+    types: [orchestrator_plan_ready]
+
+jobs:
+  intake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Show full payload
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          echo "== RAW CLIENT PAYLOAD =="
+          echo "$PAYLOAD" | jq '.'
+
+      - name: Extract orchestrator data
+        id: extract
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          echo "$PAYLOAD" | jq -r '.orchestrator' > orchestrator.json
+          echo "Saved orchestrator.json:"
+          cat orchestrator.json
+
+          # Extract a few fields for convenience
+          RUN_ID=$(jq -r '.orchestrator.run_id' orchestrator.json)
+          OBJECTIVE=$(jq -r '.orchestrator.objective' orchestrator.json)
+          STATUS=$(jq -r '.orchestrator.status' orchestrator.json)
+
+          echo "run_id=$RUN_ID"      >> $GITHUB_OUTPUT
+          echo "objective=$OBJECTIVE" >> $GITHUB_OUTPUT
+          echo "status=$STATUS"       >> $GITHUB_OUTPUT
+
+      - name: Pretty-print tasks
+        run: |
+          echo "== FINAL TASKS =="
+          jq -r '.orchestrator.tasks[] | "- " + .title + "\n  steps:\n" + ( .steps[] | "    - " + . )' orchestrator.json || true
+
+      - name: Save plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestrator-plan-${{ steps.extract.outputs.run_id }}
+          path: orchestrator.json
+
+      - name: Create summary
+        run: |
+          {
+            echo "## Orchestrator Plan"
+            echo ""
+            echo "**Run ID:** ${{ steps.extract.outputs.run_id }}"
+            echo "**Objective:** ${{ steps.extract.outputs.objective }}"
+            echo "**Status:** ${{ steps.extract.outputs.status }}"
+            echo ""
+            echo "### Tasks"
+            jq -r '.orchestrator.tasks[] | "- **\(.title)**\n  \(.steps | map("- " + .) | join("\n  "))\n"' orchestrator.json || true
+            echo ""
+            echo "### Acceptance"
+            jq -r '.orchestrator.acceptance | if length>0 then ( . | map("- " + .) | join("\n") ) else "_(none)_" end' orchestrator.json || true
+            echo ""
+            echo "### Blocking"
+            jq -r '.orchestrator.blocking | if length>0 then ( . | map("- " + .) | join("\n") ) else "_(none)_" end' orchestrator.json || true
+          } >> $GITHUB_STEP_SUMMARY
