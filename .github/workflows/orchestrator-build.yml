@@ -1,0 +1,105 @@
+name: Orchestrator Build Trigger
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  start_build:
+    if: startsWith(github.event.comment.body, '/start-build')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get issue & body
+        id: grab
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          echo "== ISSUE BODY =="
+          echo "$ISSUE_BODY"
+          # Extract run_id from the issue body line like: **Run ID:** <uuid>
+          RUN_ID=$(echo "$ISSUE_BODY" | sed -n 's/.*Run ID:\s*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
+          if [ -z "$RUN_ID" ]; then
+            echo "Could not find Run ID in issue body"; exit 1
+          fi
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+
+      - name: Download plan artifact (best-effort)
+        uses: actions/download-artifact@v4
+        with:
+          name: orchestrator-plan-${{ steps.grab.outputs.run_id }}
+          path: .
+        continue-on-error: true
+
+      - name: Build Lovable brief markdown
+        id: brief
+        run: |
+          if [ -f orchestrator.json ]; then
+            OBJECTIVE=$(jq -r '.objective' orchestrator.json)
+            TASKS=$(jq -r '.tasks[] | "* **\(.title)**\n  " + ( .steps | map("- " + .) | join("\n  ")) + "\n"' orchestrator.json)
+            ACCEPT=$(jq -r '.acceptance // [] | map("- " + .) | join("\n")' orchestrator.json)
+          else
+            OBJECTIVE="(Objective not found in artifact)"
+            TASKS="(Tasks artifact missing; see issue text)"
+            ACCEPT="(Acceptance unknown)"
+          fi
+
+          cat > lovable_brief.md <<'BRIEF'
+### Lovable Build Brief
+
+**Context / Objective**
+{{OBJECTIVE}}
+
+**What to build**
+{{TASKS}}
+
+**Acceptance checks**
+{{ACCEPT}}
+
+**Notes**
+- Follow repository code style & TypeScript strictness
+- Log every step and surface errors
+- Keep changes small and incremental; commit early
+
+BRIEF
+
+          # inject variables
+          sed -i "s|{{OBJECTIVE}}|${OBJECTIVE//|/\\|}|" lovable_brief.md
+          sed -i "s|{{TASKS}}|${TASKS//|/\\|}|" lovable_brief.md
+          sed -i "s|{{ACCEPT}}|${ACCEPT//|/\\|}|" lovable_brief.md
+
+          echo "BRIEF<<EOF" >> $GITHUB_OUTPUT
+          cat lovable_brief.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Comment Lovable brief on the issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const core = require('@actions/core');
+            const body = core.getInput('body');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+        with:
+          body: |
+            ✅ **Build started (manual via Lovable)**
+            **Run ID:** ${{ steps.grab.outputs.run_id }}
+
+            ${{ steps.brief.outputs.BRIEF }}
+
+      - name: Mark run as in_build (Supabase)
+        env:
+          ORCH_MARK_URL: ${{ secrets.ORCH_MARK_URL }}
+          ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
+        run: |
+          curl -sS -X POST "$ORCH_MARK_URL" \
+            -H "content-type: application/json" \
+            -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
+            -d "{\"run_id\":\"${{ steps.grab.outputs.run_id }}\",\"status\":\"in_build\"}"
