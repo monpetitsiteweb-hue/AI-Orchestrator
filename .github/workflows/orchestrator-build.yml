@@ -71,26 +71,19 @@ BRIEF
           sed -i "s|{{TASKS}}|${TASKS//|/\\|}|" lovable_brief.md
           sed -i "s|{{ACCEPT}}|${ACCEPT//|/\\|}|" lovable_brief.md
 
-          echo "BRIEF<<EOF" >> $GITHUB_OUTPUT
-          cat lovable_brief.md >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
       - name: Comment Lovable brief on the issue
         uses: actions/github-script@v7
-        env:
-          BODY: ${{ steps.brief.outputs.BRIEF }}
-          RUN_ID: ${{ steps.grab.outputs.run_id }}
         with:
           script: |
-            const summary = `✅ **Build started (manual via Lovable)**
-**Run ID:** ${process.env.RUN_ID}
-
-${process.env.BODY}`;
+            const fs = require('fs');
+            const brief = fs.readFileSync('lovable_brief.md','utf8');
+            const runId = `${{ steps.grab.outputs.run_id }}`;
+            const body = `✅ **Build started (manual via Lovable)**\n**Run ID:** ${runId}\n\n${brief}`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: summary
+              body
             });
 
       - name: Mark run as in_build (Supabase)
