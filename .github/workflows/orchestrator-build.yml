@@ -66,19 +66,24 @@ jobs:
 - Keep changes small and incremental; commit early
 BRIEF
 
-          # Inject variables
+          # Inject variables into the brief
           sed -i "s|{{OBJECTIVE}}|${OBJECTIVE//|/\\|}|" lovable_brief.md
           sed -i "s|{{TASKS}}|${TASKS//|/\\|}|" lovable_brief.md
           sed -i "s|{{ACCEPT}}|${ACCEPT//|/\\|}|" lovable_brief.md
 
       - name: Comment Lovable brief on the issue
         uses: actions/github-script@v7
+        env:
+          RUN_ID: ${{ steps.grab.outputs.run_id }}
         with:
           script: |
             const fs = require('fs');
             const brief = fs.readFileSync('lovable_brief.md','utf8');
-            const runId = `${{ steps.grab.outputs.run_id }}`;
-            const body = `✅ **Build started (manual via Lovable)**\n**Run ID:** ${runId}\n\n${brief}`;
+            const runId = process.env.RUN_ID;
+            const body = `✅ **Build started (manual via Lovable)**
+**Run ID:** ${runId}
+
+${brief}`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -90,8 +95,11 @@ BRIEF
         env:
           ORCH_MARK_URL: ${{ secrets.ORCH_MARK_URL }}
           ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
+          RUN_ID: ${{ steps.grab.outputs.run_id }}
         run: |
+          # Build JSON safely with jq to avoid YAML/quoting issues
+          PAYLOAD=$(jq -n --arg run_id "$RUN_ID" --arg status "in_build" '{run_id:$run_id,status:$status}')
           curl -sS -X POST "$ORCH_MARK_URL" \
             -H "content-type: application/json" \
             -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
-            -d "{\"run_id\":\"${{ steps.grab.outputs.run_id }}\",\"status\":\"in_build\"}"
+            -d "$PAYLOAD"
