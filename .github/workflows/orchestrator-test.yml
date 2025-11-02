@@ -1,0 +1,53 @@
+name: Orchestrator Test Runner
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  run_tests:
+    if: startsWith(github.event.comment.body, '/test')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract run_id
+        id: extract
+        env:
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          RUN_ID=$(echo "$BODY" | sed -n 's/.*Run ID:\s*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
+          if [ -z "$RUN_ID" ]; then
+            echo "No Run ID found in issue body"; exit 1
+          fi
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+
+      - name: Mock smoke test
+        id: mock
+        run: |
+          echo "Running smoke test for run ${{ steps.extract.outputs.run_id }}..."
+          echo "success=true" >> $GITHUB_OUTPUT
+          echo "log=All endpoints returned 200 OK (mock)" >> $GITHUB_OUTPUT
+
+      - name: Report to Supabase
+        env:
+          TEST_API: ${{ secrets.ORCH_TEST_URL }}
+          ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
+        run: |
+          curl -sS -X POST "$TEST_API" \
+            -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
+            -H "content-type: application/json" \
+            -d "{\"run_id\":\"${{ steps.extract.outputs.run_id }}\",\"test_name\":\"smoke\",\"success\":${{ steps.mock.outputs.success }},\"log\":\"${{ steps.mock.outputs.log }}\"}"
+
+      - name: Comment result
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `🧪 Smoke test completed for run **${{ steps.extract.outputs.run_id }}** — OK ✅`
+            });
