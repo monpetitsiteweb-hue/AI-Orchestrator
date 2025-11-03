@@ -9,7 +9,6 @@ permissions:
   issues: write
 
 env:
-  # We use SERVICE ROLE only to read the merged 3-AI prompt from Supabase.
   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
   SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
 
@@ -48,51 +47,34 @@ jobs:
           printf "%s\n" "$ISSUE_BODY"
           echo "== ISSUE BODY END =="
 
-          # Normalize: remove CR, strip markdown asterisks, collapse spaces
           CLEAN=$(printf "%s" "$ISSUE_BODY" | tr -d '\r' | sed 's/\*\*//g' | tr -s ' ')
-
-          # Try 1: explicit 'Run ID:' line
           RUN_ID=$(printf "%s" "$CLEAN" | sed -nE 's/.*Run ID:\s*([0-9a-f-]{36}).*/\1/p' | head -n1)
-
-          # Try 2: first UUID anywhere in the body (fallback)
           if [ -z "$RUN_ID" ]; then
             RUN_ID=$(printf "%s" "$CLEAN" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -n1)
           fi
-
           if [ -z "$RUN_ID" ]; then
             echo "Could not find Run ID in issue body (after normalization)"; exit 1
           fi
-
           echo "Extracted run_id: $RUN_ID"
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
-      # === NEW: fetch the merged 3-AI prompt directly from Supabase ===
-      - name: Fetch 3-AI merged prompt from Supabase
+      - name: Fetch 3-AI merged prompt from Supabase (runs.final_prompt_markdown)
         if: steps.check.outputs.match == 'true'
         id: fetch
         env:
           RUN_ID: ${{ steps.grab.outputs.run_id }}
         run: |
           set -euo pipefail
-          if [ -z "${SUPABASE_URL:-}" ] || [ -z "${SUPABASE_SERVICE_ROLE:-}" ]; then
-            echo "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE secrets"; exit 1
-          fi
-
-          # Pull final_prompt_markdown for this run_id
-          RESP="$(curl -sS "${SUPABASE_URL}/rest/v1/orchestrator_runs?run_id=eq.${RUN_ID}&select=final_prompt_markdown" \
+          RESP="$(curl -sS "${SUPABASE_URL}/rest/v1/runs?id=eq.${RUN_ID}&select=final_prompt_markdown" \
             -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
-            -H "Accept: application/json")" || { echo "Supabase request failed"; exit 1; }
-
+            -H "Accept: application/json")"
+          echo "$RESP" | jq .
           PROMPT="$(echo "$RESP" | jq -r '.[0].final_prompt_markdown // empty')"
-
           if [ -z "$PROMPT" ]; then
-            echo "Merged 3-AI prompt is missing for run_id=${RUN_ID}."
-            echo "Response from Supabase: $RESP"
-            echo "If this persists: ensure /orchestrator-run writes orchestrator_runs.final_prompt_markdown for this run."
+            echo "final_prompt_markdown is empty for runs.id=${RUN_ID}"
             exit 2
           fi
-
           printf "%s\n" "$PROMPT" > lovable_prompt.md
           echo "prompt_path=lovable_prompt.md" >> "$GITHUB_OUTPUT"
 
@@ -149,17 +131,13 @@ jobs:
           set -e
           PAYLOAD=$(jq -n --arg run_id "$RUN_ID" --arg status "in_build" '{run_id:$run_id,status:$status}')
           echo "POSTing to $ORCH_MARK_URL"
-
           HTTP_CODE=$(curl -sS -o resp.txt -w "%{http_code}" -X POST "$ORCH_MARK_URL" \
             -H "content-type: application/json" \
             -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
             -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
             -d "$PAYLOAD")
-
           echo "HTTP $HTTP_CODE"
-          echo "Response:"
-          cat resp.txt || true
-
+          echo "Response:"; cat resp.txt || true
           if [ "$HTTP_CODE" -ge 300 ]; then
             echo "Mark endpoint failed (HTTP $HTTP_CODE)"; exit 1
           fi
