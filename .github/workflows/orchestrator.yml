@@ -77,107 +77,93 @@ jobs:
 
             core.setOutput('issue_number', String(data.number));
 
-      - name: Build Lovable brief (robust)
-        id: brief
-        env:
-          RUN_ID: ${{ steps.extract.outputs.run_id }}
-          SUPABASE_URL: ${{ env.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ env.SUPABASE_ANON_KEY }}
-        run: |
-          set -eo pipefail
+    - name: Build Lovable brief (from payload or Supabase)
+      shell: bash
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        RUN_ID: ${{ steps.parse.outputs.run_id }}
+      run: |
+        set -e
 
-          echo "== Copy judge from payload if present =="
-          if jq -e '.client_payload.orchestrator.judge' "$GITHUB_EVENT_PATH" >/dev/null 2>&1; then
-            jq '.client_payload.orchestrator.judge' "$GITHUB_EVENT_PATH" > judge.json
-            echo "Judge loaded from payload."
-          else
-            echo "Judge not in payload, fetching from Supabase…"
-            URL="${SUPABASE_URL}/rest/v1/orch_messages?run_id=eq.${RUN_ID}&role=eq.judge&select=content_json,id&order=id.desc&limit=1"
-            HTTP=$(curl -sS -o supa.json -w "%{http_code}" \
-              -H "apikey: ${SUPABASE_ANON_KEY}" \
-              -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
-              "$URL")
-            echo "Supabase HTTP $HTTP"
-            cat supa.json || true
-            if [ "$HTTP' " -ge 300 ] || ! jq -e '.[0].content_json' supa.json >/dev/null 2>&1; then
-              echo "WARN: Could not fetch judge from Supabase; using empty fallback."
-              printf '{}' > judge.json
-            else
-              jq '.[0].content_json' supa.json > judge.json
-            fi
+        # Try payload first
+        jq -e '.client_payload.orchestrator.judge' "$GITHUB_EVENT_PATH" > judge.json || true
+
+        # Fallback to Supabase (your table is orchestrator.messages)
+        if [ ! -s judge.json ]; then
+          echo "Judge not in payload, fetching from Supabase…"
+          URL="${SUPABASE_URL}/rest/v1/orchestrator.messages?run_id=eq.${RUN_ID}&role=eq.judge&select=content_json,id&order=id.desc&limit=1"
+          HTTP=$(curl -sS -o supa.json -w "%{http_code}" \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            "$URL")
+          echo "Supabase HTTP $HTTP"
+          cat supa.json
+
+          if [ "$HTTP" -ge 300 ]; then
+            echo "Failed to fetch judge JSON from Supabase"; exit 1
           fi
 
-          echo "== judge.json =="
-          cat judge.json || true
+          jq -e '.[0].content_json' supa.json > judge.json
+        fi
 
-          # Acceptance may live either in judge or at payload level; we normalize.
-          jq -n \
-            --slurpfile judge judge.json \
-            --slurpfile evt "$GITHUB_EVENT_PATH" \
-            '
-              def arr(x): if (x|type)=="array" then x else [] end;
-              {
-                judge: $judge[0],
-                acc_hint: (
-                  arr($evt[0].client_payload.acceptance)
-                  + arr($evt[0].client_payload.orchestrator.acceptance)
-                )
-              }
-            ' > plan.json
+        jq -e '.' judge.json > /dev/null
 
-          echo "== plan.json (normalized) =="
-          jq . plan.json || true
+        # Create plan.json (normalize)
+        jq -n \
+          --slurpfile judge judge.json \
+          --slurpfile evt "$GITHUB_EVENT_PATH" \
+          '
+            {
+              judge: $judge[0],
+              payload_acceptance: ($evt[0].client_payload.acceptance // $evt[0].client_payload.orchestrator.acceptance // null)
+            }
+          ' > plan.json
 
-          # Build a resilient Lovable brief; never fail if fields are missing.
-          jq -r '
-            def bullets($a):
-              if ($a|type)=="array" and ($a|length)>0
-              then ($a[]|"- "+tostring)
-              else "- (none)"
-              end;
+        # Render brief.md
+        jq -r '
+          def bullets($arr):
+            if ($arr|type) == "array" and ($arr|length) > 0
+            then ($arr[] | "- " + (tostring)) else "- (none)" end;
 
-            . as $root
-            | ($root.judge.final_tasks // []) as $fts
-            | ($fts[0] // {}) as $t
-            | ( ($root.judge.acceptance // []) + ($root.acc_hint // []) ) as $acc
+          . as $root
+          | ($root.judge.final_tasks[0] // {}) as $t
+          | ($root.judge.acceptance // $root.payload_acceptance // []) as $acc
+          | (
+              "## Lovable Build Brief",
+              "",
+              "**Goal**",
+              ($t.title // "Unnamed task"),
+              "",
+              "**Why**",
+              ($t.why // "—"),
+              "",
+              "**Steps**",
+              (bullets($t.steps)),
+              "",
+              "**Acceptance (must be testable)**",
+              (bullets($acc)),
+              "",
+              "_Auto-posted from Orchestrator plan_"
+            ) | join("\n")
+        ' plan.json > lovable_brief.md
 
-            | (
-                "## Lovable Build Brief",
-                "",
-                "**Goal**",
-                ($t.title // "Unnamed task"),
-                "",
-                "**Why**",
-                ($t.why // "—"),
-                "",
-                "**Steps**",
-                bullets($t.steps // []),
-                "",
-                "**Acceptance (must be testable)**",
-                bullets($acc),
-                "",
-                "_Auto-posted from Orchestrator plan_"
-              ) | join("\n")
-          ' plan.json > lovable_brief.md
+        echo "brief_ready=true" >> $GITHUB_OUTPUT
 
-          echo "== lovable_brief.md =="
-          cat lovable_brief.md || true
+    - name: Post Lovable brief as issue comment
+      if: steps.parse.outputs.issue_number && steps.parse.outputs.issue_number != '' && steps.build_lovable.outputs.brief_ready == 'true'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const body = fs.readFileSync('lovable_brief.md', 'utf8');
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: Number('${{ steps.parse.outputs.issue_number }}'),
+            body
+          });
 
-
-      - name: Comment Lovable brief on the Issue
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const issue_number = parseInt("${{ steps.create_issue.outputs.issue_number }}", 10);
-            const fs = require('fs');
-            const body = fs.readFileSync('lovable_brief.md', 'utf8');
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number,
-              body
-            });
 
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
