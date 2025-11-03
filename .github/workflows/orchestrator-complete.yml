@@ -1,0 +1,84 @@
+name: Orchestrator Complete Trigger
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  complete_build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Debug comment body
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          echo "=== RAW COMMENT BODY START ==="
+          printf "%s\n" "$BODY"
+          echo "=== RAW COMMENT BODY END ==="
+
+      - name: Check for /complete-build
+        id: check
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          if echo "$BODY" | grep -qi '^/complete-build$'; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            echo "Found EXACT /complete-build"
+          else
+            echo "match=false" >> "$GITHUB_OUTPUT"
+            echo "Did NOT find exact /complete-build"
+          fi
+
+      - name: Extract run_id from issue body
+        if: steps.check.outputs.match == 'true'
+        id: grab
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          CLEAN=$(printf "%s" "$ISSUE_BODY" | tr -d '\r' | sed 's/\*\*//g' | tr -s ' ')
+          RUN_ID=$(printf "%s" "$CLEAN" | sed -nE 's/.*Run ID:\s*([0-9a-f-]{36}).*/\1/p' | head -n1)
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID=$(printf "%s" "$CLEAN" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -n1)
+          fi
+          if [ -z "$RUN_ID" ]; then
+            echo "Could not find Run ID in issue body"; exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Extracted run_id: $RUN_ID"
+
+      - name: Mark run as built (Supabase)
+        if: steps.check.outputs.match == 'true'
+        env:
+          ORCH_MARK_URL: ${{ secrets.ORCH_MARK_URL }}
+          ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          RUN_ID: ${{ steps.grab.outputs.run_id }}
+        run: |
+          set -e
+          PAYLOAD=$(jq -n --arg run_id "$RUN_ID" --arg status "built" '{run_id:$run_id,status:$status}')
+          HTTP_CODE=$(curl -sS -o resp.txt -w "%{http_code}" -X POST "$ORCH_MARK_URL" \
+            -H "content-type: application/json" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
+            -d "$PAYLOAD")
+          echo "HTTP $HTTP_CODE"
+          cat resp.txt || true
+          if [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Mark endpoint failed (HTTP $HTTP_CODE)"; exit 1
+          fi
+
+      - name: Trigger tests by commenting /test
+        if: steps.check.outputs.match == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '/test'
+            })
