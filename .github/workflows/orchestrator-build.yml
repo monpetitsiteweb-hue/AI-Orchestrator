@@ -2,7 +2,7 @@ name: Orchestrator Build Trigger
 
 on:
   issue_comment:
-    types: [created, edited]    # run on any new/edited comment
+    types: [created, edited]
 
 permissions:
   contents: read
@@ -12,27 +12,30 @@ jobs:
   start_build:
     runs-on: ubuntu-latest
     steps:
-      - name: Show full event payload (for debugging)
+      # Always runs so you can see what GitHub actually received
+      - name: Debug comment body
+        env:
+          BODY: ${{ github.event.comment.body }}
         run: |
-          echo "=== comment body ==="
-          printf "%s\n" "${{ github.event.comment.body }}"
-          echo "=== end ==="
-          echo "JSON payload follows:"
-          echo '${{ toJSON(github.event) }}'
+          echo "=== RAW COMMENT BODY START ==="
+          printf "%s\n" "$BODY"
+          echo "=== RAW COMMENT BODY END ==="
 
-      - name: Check if comment asks to start build
+      # Decide whether to proceed
+      - name: Check for /start-build
         id: check
         env:
           BODY: ${{ github.event.comment.body }}
         run: |
           if echo "$BODY" | grep -qi '/start-build'; then
-            echo "match=true" >> $GITHUB_OUTPUT
+            echo "match=true" >> "$GITHUB_OUTPUT"
             echo "Found /start-build"
           else
-            echo "match=false" >> $GITHUB_OUTPUT
+            echo "match=false" >> "$GITHUB_OUTPUT"
             echo "Did NOT find /start-build"
           fi
 
+      # Extract run_id from the issue body
       - name: Get issue & extract run_id
         if: steps.check.outputs.match == 'true'
         id: grab
@@ -40,13 +43,14 @@ jobs:
           ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
           echo "== ISSUE BODY =="
-          echo "$ISSUE_BODY"
+          printf "%s\n" "$ISSUE_BODY"
           RUN_ID=$(echo "$ISSUE_BODY" | sed -n 's/.*Run ID:\s*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
           if [ -z "$RUN_ID" ]; then
             echo "Could not find Run ID in issue body"; exit 1
           fi
-          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
+      # Try to pull the plan artifact; if absent, we still proceed
       - name: Download plan artifact (best-effort)
         if: steps.check.outputs.match == 'true'
         uses: actions/download-artifact@v4
@@ -55,9 +59,9 @@ jobs:
           path: .
         continue-on-error: true
 
+      # Build a Lovable brief (from artifact if present, else placeholders)
       - name: Build Lovable brief markdown
         if: steps.check.outputs.match == 'true'
-        id: brief
         run: |
           if [ -f orchestrator.json ]; then
             OBJECTIVE=$(jq -r '.objective' orchestrator.json)
@@ -91,6 +95,7 @@ BRIEF
           sed -i "s|{{TASKS}}|${TASKS//|/\\|}|" lovable_brief.md
           sed -i "s|{{ACCEPT}}|${ACCEPT//|/\\|}|" lovable_brief.md
 
+      # Post the brief on the issue
       - name: Comment Lovable brief on the issue
         if: steps.check.outputs.match == 'true'
         uses: actions/github-script@v7
@@ -100,7 +105,10 @@ BRIEF
           script: |
             const fs = require('fs');
             const brief = fs.readFileSync('lovable_brief.md','utf8');
-            const body = `✅ **Build started (manual via Lovable)**\n**Run ID:** ${process.env.RUN_ID}\n\n${brief}`;
+            const body = `✅ **Build started (manual via Lovable)**
+**Run ID:** ${process.env.RUN_ID}
+
+${brief}`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -108,6 +116,7 @@ BRIEF
               body
             });
 
+      # Flip status to in_build in Supabase
       - name: Mark run as in_build (Supabase)
         if: steps.check.outputs.match == 'true'
         env:
