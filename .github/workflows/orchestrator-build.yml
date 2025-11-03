@@ -8,6 +8,11 @@ permissions:
   contents: read
   issues: write
 
+env:
+  # We use SERVICE ROLE only to read the merged 3-AI prompt from Supabase.
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+
 jobs:
   start_build:
     runs-on: ubuntu-latest
@@ -61,52 +66,53 @@ jobs:
           echo "Extracted run_id: $RUN_ID"
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Download plan artifact (best-effort)
+      # === NEW: fetch the merged 3-AI prompt directly from Supabase ===
+      - name: Fetch 3-AI merged prompt from Supabase
         if: steps.check.outputs.match == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          name: orchestrator-plan-${{ steps.grab.outputs.run_id }}
-          path: .
-        continue-on-error: true
-
-      - name: Build Lovable brief (rich if artifact exists)
-        if: steps.check.outputs.match == 'true'
-        id: brief
+        id: fetch
+        env:
+          RUN_ID: ${{ steps.grab.outputs.run_id }}
         run: |
-          if [ -f orchestrator.json ]; then
-            OBJECTIVE=$(jq -r '.objective' orchestrator.json)
-            echo "Found orchestrator.json with objective: $OBJECTIVE"
-            TASKS=$(jq -r '.tasks[] | "* **\(.title)**\n  " + ( .steps | map("- " + .) | join("\n  ")) + "\n"' orchestrator.json)
-            ACCEPT=$(jq -r '.acceptance // [] | map("- " + .) | join("\n")' orchestrator.json)
-          else
-            OBJECTIVE="(Objective not found in artifact)"
-            TASKS="(Tasks artifact missing; see issue text)"
-            ACCEPT="(Acceptance unknown)"
+          set -euo pipefail
+          if [ -z "${SUPABASE_URL:-}" ] || [ -z "${SUPABASE_SERVICE_ROLE:-}" ]; then
+            echo "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE secrets"; exit 1
           fi
 
-          {
-            echo "### Lovable Build Brief"
-            echo
-            echo "**Context / Objective**"
-            echo "$OBJECTIVE"
-            echo
-            echo "**What to build**"
-            echo "$TASKS"
-            echo
-            echo "**Acceptance checks**"
-            echo "$ACCEPT"
-            echo
-            echo "**Notes**"
-            echo "- Follow repository code style & TypeScript strictness"
-            echo "- Log every step and surface errors"
-            echo "- Keep changes small and incremental; commit early"
-          } > lovable_brief.md
+          # Pull final_prompt_markdown for this run_id
+          RESP="$(curl -sS "${SUPABASE_URL}/rest/v1/orchestrator_runs?run_id=eq.${RUN_ID}&select=final_prompt_markdown" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
+            -H "Accept: application/json")" || { echo "Supabase request failed"; exit 1; }
 
+          PROMPT="$(echo "$RESP" | jq -r '.[0].final_prompt_markdown // empty')"
 
+          if [ -z "$PROMPT" ]; then
+            echo "Merged 3-AI prompt is missing for run_id=${RUN_ID}."
+            echo "Response from Supabase: $RESP"
+            echo "If this persists: ensure /orchestrator-run writes orchestrator_runs.final_prompt_markdown for this run."
+            exit 2
+          fi
 
+          printf "%s\n" "$PROMPT" > lovable_prompt.md
+          echo "prompt_path=lovable_prompt.md" >> "$GITHUB_OUTPUT"
 
+      - name: Post Lovable Build Brief (3-AI output)
+        if: steps.check.outputs.match == 'true'
+        uses: actions/github-script@v7
+        env:
+          PROMPT_PATH: ${{ steps.fetch.outputs.prompt_path }}
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync(process.env.PROMPT_PATH, 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
 
-      - name: Post Lovable build brief on the issue
+      - name: Post build-start confirmation
         if: steps.check.outputs.match == 'true'
         uses: actions/github-script@v7
         env:
@@ -144,8 +150,6 @@ jobs:
           PAYLOAD=$(jq -n --arg run_id "$RUN_ID" --arg status "in_build" '{run_id:$run_id,status:$status}')
           echo "POSTing to $ORCH_MARK_URL"
 
-          # The Function Gateway expects a valid Supabase JWT in Authorization.
-          # Use the ANON key there, and keep our custom admin header for your function's own check.
           HTTP_CODE=$(curl -sS -o resp.txt -w "%{http_code}" -X POST "$ORCH_MARK_URL" \
             -H "content-type: application/json" \
             -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
