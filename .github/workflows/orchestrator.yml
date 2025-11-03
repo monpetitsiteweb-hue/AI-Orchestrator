@@ -99,7 +99,7 @@ jobs:
               "$URL")
             echo "Supabase HTTP $HTTP"
             cat supa.json || true
-            if [ "$HTTP' " -ge 300 ] || ! jq -e '.[0].content_json' supa.json >/dev/null 2>&1; then
+            if [ "$HTTP" -ge 300 ] || ! jq -e '.[0].content_json' supa.json >/dev/null 2>&1; then
               echo "WARN: Could not fetch judge from Supabase; using empty fallback."
               printf '{}' > judge.json
             else
