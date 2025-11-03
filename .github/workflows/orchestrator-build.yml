@@ -61,6 +61,51 @@ jobs:
           echo "Extracted run_id: $RUN_ID"
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
+      - name: Download plan artifact (best-effort)
+        if: steps.check.outputs.match == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: orchestrator-plan-${{ steps.grab.outputs.run_id }}
+          path: .
+        continue-on-error: true
+
+      - name: Build Lovable brief (rich if artifact exists)
+        if: steps.check.outputs.match == 'true'
+        id: brief
+        run: |
+          if [ -f orchestrator.json ]; then
+            OBJECTIVE=$(jq -r '.objective' orchestrator.json)
+            echo "Found orchestrator.json with objective: $OBJECTIVE"
+            TASKS=$(jq -r '.tasks[] | "* **\(.title)**\n  " + ( .steps | map("- " + .) | join("\n  ")) + "\n"' orchestrator.json)
+            ACCEPT=$(jq -r '.acceptance // [] | map("- " + .) | join("\n")' orchestrator.json)
+          else
+            OBJECTIVE="(Objective not found in artifact)"
+            TASKS="(Tasks artifact missing; see issue text)"
+            ACCEPT="(Acceptance unknown)"
+          fi
+
+          {
+            echo "### Lovable Build Brief"
+            echo
+            echo "**Context / Objective**"
+            echo "$OBJECTIVE"
+            echo
+            echo "**What to build**"
+            echo "$TASKS"
+            echo
+            echo "**Acceptance checks**"
+            echo "$ACCEPT"
+            echo
+            echo "**Notes**"
+            echo "- Follow repository code style & TypeScript strictness"
+            echo "- Log every step and surface errors"
+            echo "- Keep changes small and incremental; commit early"
+          } > lovable_brief.md
+
+
+
+
+
       - name: Post Lovable build brief on the issue
         if: steps.check.outputs.match == 'true'
         uses: actions/github-script@v7
