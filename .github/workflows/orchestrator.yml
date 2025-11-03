@@ -29,10 +29,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Try multiple shapes:
-          # 1) client_payload.run_id
-          # 2) client_payload.orchestrator.run_id
-          # 3) client_payload.payload.run_id   (just in case)
           RUN_ID=$(
             jq -r '
               .client_payload.run_id
@@ -41,14 +37,12 @@ jobs:
               // empty
             ' "$GITHUB_EVENT_PATH"
           )
-
           if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
             echo "No run_id in payload"
             exit 1
           fi
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
-          # Objective can also be nested; fallbacks included:
           OBJ=$(
             jq -r '
               .client_payload.objective
@@ -111,17 +105,26 @@ jobs:
           echo "Timed out waiting for 3-AI to write runs.final_prompt_markdown for id=${RUN_ID}"
           exit 2
 
+      - name: Show prompt (debug)
+        run: |
+          echo "=== PROMPT START ==="
+          cat lovable_prompt.md
+          echo "=== PROMPT END ==="
+
       - name: Post Lovable Build Brief (3-AI output)
         uses: actions/github-script@v7
         env:
           PROMPT_PATH: ${{ steps.wait_prompt.outputs.prompt_path }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.issue_number }}
         with:
           script: |
             const fs = require('fs');
+            const issue_number = parseInt(process.env.ISSUE_NUMBER, 10);
+            if (!issue_number) throw new Error('Missing ISSUE_NUMBER');
             const body = fs.readFileSync(process.env.PROMPT_PATH, 'utf8');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number,
               body
             });
