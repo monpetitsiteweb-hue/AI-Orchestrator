@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   complete_build:
+    if: github.event_name == 'issue_comment' && contains(github.event.comment.body, '/complete-build')
     runs-on: ubuntu-latest
     steps:
       - name: Debug comment body
