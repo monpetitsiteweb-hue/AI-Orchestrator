@@ -2,7 +2,7 @@ name: Orchestrator Build Trigger
 
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited]   # catch both fresh and edited comments
 
 permissions:
   contents: read
@@ -10,9 +10,16 @@ permissions:
 
 jobs:
   start_build:
-    if: startsWith(github.event.comment.body, '/start-build')
+    # more tolerant than startsWith(...):
+    if: contains(github.event.comment.body, '/start-build')
     runs-on: ubuntu-latest
     steps:
+      - name: Debug comment body
+        run: |
+          echo "== RAW COMMENT BODY START =="
+          printf "%s\n" "${{ github.event.comment.body }}"
+          echo "== RAW COMMENT BODY END =="
+
       - name: Get issue & body
         id: grab
         env:
@@ -20,8 +27,6 @@ jobs:
         run: |
           echo "== ISSUE BODY =="
           echo "$ISSUE_BODY"
-
-          # Extract run_id from a line like: **Run ID:** <uuid>
           RUN_ID=$(echo "$ISSUE_BODY" | sed -n 's/.*Run ID:\s*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
           if [ -z "$RUN_ID" ]; then
             echo "Could not find Run ID in issue body"; exit 1
@@ -66,7 +71,6 @@ jobs:
 - Keep changes small and incremental; commit early
 BRIEF
 
-          # Inject variables into the brief
           sed -i "s|{{OBJECTIVE}}|${OBJECTIVE//|/\\|}|" lovable_brief.md
           sed -i "s|{{TASKS}}|${TASKS//|/\\|}|" lovable_brief.md
           sed -i "s|{{ACCEPT}}|${ACCEPT//|/\\|}|" lovable_brief.md
@@ -97,7 +101,6 @@ ${brief}`;
           ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
           RUN_ID: ${{ steps.grab.outputs.run_id }}
         run: |
-          # Build JSON safely with jq to avoid YAML/quoting issues
           PAYLOAD=$(jq -n --arg run_id "$RUN_ID" --arg status "in_build" '{run_id:$run_id,status:$status}')
           curl -sS -X POST "$ORCH_MARK_URL" \
             -H "content-type: application/json" \
