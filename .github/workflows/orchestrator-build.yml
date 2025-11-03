@@ -94,8 +94,22 @@ jobs:
           ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
           RUN_ID: ${{ steps.grab.outputs.run_id }}
         run: |
+          set -e
           PAYLOAD=$(jq -n --arg run_id "$RUN_ID" --arg status "in_build" '{run_id:$run_id,status:$status}')
-          curl -sS -X POST "$ORCH_MARK_URL" \
+          echo "POSTing to $ORCH_MARK_URL"
+
+          # Send BOTH headers to satisfy either scheme
+          HTTP_CODE=$(curl -sS -o resp.txt -w "%{http_code}" -X POST "$ORCH_MARK_URL" \
             -H "content-type: application/json" \
             -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
-            -d "$PAYLOAD"
+            -H "Authorization: Bearer $ORCH_ADMIN_SECRET" \
+            -d "$PAYLOAD")
+
+          echo "HTTP $HTTP_CODE"
+          echo "Response:"
+          cat resp.txt || true
+
+          # Fail the job if not 2xx so we can see it immediately
+          if [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Mark endpoint failed (HTTP $HTTP_CODE)"; exit 1
+          fi
