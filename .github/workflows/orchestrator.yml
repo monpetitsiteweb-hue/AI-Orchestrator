@@ -132,36 +132,41 @@ jobs:
           jq -r '
             def bullets($a):
               if ($a|type)=="array" and ($a|length)>0
-              then ($a[]|"- "+tostring)
-              else "- (none)"
+              then ($a | map("- " + (tostring)))
+              else ["- (none)"]
               end;
-
+          
             . as $root
             | ($root.judge.final_tasks // []) as $fts
             | ($fts[0] // {}) as $t
             | ( ($root.judge.acceptance // []) + ($root.acc_hint // []) ) as $acc
-
+          
             | (
-                "## Lovable Build Brief",
-                "",
-                "**Goal**",
-                ($t.title // "Unnamed task"),
-                "",
-                "**Why**",
-                ($t.why // "—"),
-                "",
-                "**Steps**",
-                bullets($t.steps // []),
-                "",
-                "**Acceptance (must be testable)**",
-                bullets($acc),
-                "",
-                "_Auto-posted from Orchestrator plan_"
-              ) | join("\n")
+                [
+                  "## Lovable Build Brief",
+                  "",
+                  "**Goal**",
+                  ($t.title // "Unnamed task"),
+                  "",
+                  "**Why**",
+                  ($t.why // "—"),
+                  "",
+                  "**Steps**"
+                ]
+                + bullets($t.steps // [])
+                + [
+                    "",
+                    "**Acceptance (must be testable)**"
+                  ]
+                + bullets($acc)
+                + [
+                    "",
+                    "_Auto-posted from Orchestrator plan_"
+                  ]
+              )
+            | join("\n")
           ' plan.json > lovable_brief.md
 
-          echo "== lovable_brief.md =="
-          cat lovable_brief.md || true
 
 
       - name: Comment Lovable brief on the Issue
