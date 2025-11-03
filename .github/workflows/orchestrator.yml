@@ -11,6 +11,7 @@ permissions:
 env:
   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
   SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+  SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
 
 jobs:
   intake:
@@ -25,7 +26,6 @@ jobs:
         id: extract
         run: |
           set -e
-          # Try multiple locations for run_id to be future-proof
           RUN_ID=$(
             jq -r '
               .client_payload.run_id
@@ -38,7 +38,6 @@ jobs:
           fi
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
-          # Try to extract a human objective; accept various locations
           OBJ=$(
             jq -r '
               .client_payload.objective
@@ -110,7 +109,7 @@ jobs:
           echo "== judge.json =="
           cat judge.json || true
 
-          # Acceptance may live either in judge or at payload level; we normalize.
+          # Normalize acceptance hints
           jq -n \
             --slurpfile judge judge.json \
             --slurpfile evt "$GITHUB_EVENT_PATH" \
@@ -128,22 +127,22 @@ jobs:
           echo "== plan.json (normalized) =="
           jq . plan.json || true
 
-          # Build a resilient Lovable brief; never fail if fields are missing.
+          # Build a resilient Lovable brief
           jq -r '
             def bullets($a):
               if ($a|type)=="array" and ($a|length)>0
               then ($a | map("- " + (tostring)))
               else ["- (none)"]
               end;
-          
+
             . as $root
             | ($root.judge.final_tasks // []) as $fts
             | ($fts[0] // {}) as $t
             | ( ($root.judge.acceptance // []) + ($root.acc_hint // []) ) as $acc
-          
+
             | (
                 [
-                  "## Lovable Build Brief",
+                  "### Lovable Build Brief",
                   "",
                   "**Goal**",
                   ($t.title // "Unnamed task"),
@@ -167,8 +166,6 @@ jobs:
             | join("\n")
           ' plan.json > lovable_brief.md
 
-
-
       - name: Comment Lovable brief on the Issue
         uses: actions/github-script@v7
         with:
@@ -184,7 +181,30 @@ jobs:
               body
             });
 
-      - name: Upload plan artifact
+      - name: Persist Lovable brief into runs.final_prompt_markdown
+        env:
+          RUN_ID: ${{ steps.extract.outputs.run_id }}
+          SUPABASE_URL: ${{ env.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE: ${{ env.SUPABASE_SERVICE_ROLE }}
+        run: |
+          set -euo pipefail
+          [ -s lovable_brief.md ] || { echo "lovable_brief.md missing"; exit 1; }
+          # Patch the row so /start-build can fetch it later
+          jq -Rs '{ final_prompt_markdown: . }' lovable_brief.md > patch.json
+          curl -sS -o resp.json -w "%{http_code}" -X PATCH \
+            "${SUPABASE_URL}/rest/v1/runs?id=eq.${RUN_ID}" \
+            -H "Content-Type: application/json" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
+            --data-binary @patch.json | tee httpcode.txt
+          code=$(cat httpcode.txt)
+          echo "HTTP $code"
+          cat resp.json || true
+          if [ "$code" -ge 300 ]; then
+            echo "Failed to persist final_prompt_markdown"; exit 1
+          fi
+
+      - name: Upload plan artifact (optional)
         uses: actions/upload-artifact@v4
         with:
           name: orchestrator-plan-${{ steps.extract.outputs.run_id }}
