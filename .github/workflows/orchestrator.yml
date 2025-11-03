@@ -18,17 +18,45 @@ jobs:
     steps:
       - name: Show event payload (debug)
         run: |
+          echo "=== GITHUB_EVENT_PATH ==="
           echo "$GITHUB_EVENT_PATH"
+          echo "=== RAW EVENT JSON START ==="
           cat "$GITHUB_EVENT_PATH"
+          echo "=== RAW EVENT JSON END ==="
 
-      - name: Extract run_id & objective
+      - name: Extract run_id & objective (robust)
         id: extract
         run: |
-          set -e
-          RUN_ID=$(jq -r '.client_payload.run_id // empty' "$GITHUB_EVENT_PATH")
-          if [ -z "$RUN_ID" ]; then echo "No run_id in payload"; exit 1; fi
+          set -euo pipefail
+
+          # Try multiple shapes:
+          # 1) client_payload.run_id
+          # 2) client_payload.orchestrator.run_id
+          # 3) client_payload.payload.run_id   (just in case)
+          RUN_ID=$(
+            jq -r '
+              .client_payload.run_id
+              // .client_payload.orchestrator.run_id
+              // .client_payload.payload.run_id
+              // empty
+            ' "$GITHUB_EVENT_PATH"
+          )
+
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "No run_id in payload"
+            exit 1
+          fi
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          OBJ=$(jq -r '.client_payload.objective // "Objective not provided"' "$GITHUB_EVENT_PATH")
+
+          # Objective can also be nested; fallbacks included:
+          OBJ=$(
+            jq -r '
+              .client_payload.objective
+              // .client_payload.orchestrator.objective
+              // .client_payload.payload.objective
+              // "Objective not provided"
+            ' "$GITHUB_EVENT_PATH"
+          )
           echo "objective=$OBJ" >> "$GITHUB_OUTPUT"
 
       - name: Create Issue (work order)
@@ -64,7 +92,7 @@ jobs:
           RUN_ID: ${{ steps.extract.outputs.run_id }}
         run: |
           set -euo pipefail
-          ATTEMPTS=12   # ~60s
+          ATTEMPTS=12   # ~60s total
           SLEEP=5
           for i in $(seq 1 $ATTEMPTS); do
             RESP="$(curl -sS "${SUPABASE_URL}/rest/v1/runs?id=eq.${RUN_ID}&select=final_prompt_markdown" \
