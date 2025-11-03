@@ -1,4 +1,4 @@
-name: Orchestrator Build Trigger (smoke)
+name: Orchestrator Build Trigger (step2)
 
 on:
   issue_comment:
@@ -9,7 +9,7 @@ permissions:
   issues: write
 
 jobs:
-  smoke:
+  start_build:
     runs-on: ubuntu-latest
     steps:
       - name: Debug comment body
@@ -19,3 +19,34 @@ jobs:
           echo "=== RAW COMMENT BODY START ==="
           printf "%s\n" "$BODY"
           echo "=== RAW COMMENT BODY END ==="
+
+      - name: Check for /start-build
+        id: check
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          if echo "$BODY" | grep -qi '^/start-build$'; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            echo "Found EXACT /start-build"
+          else
+            echo "match=false" >> "$GITHUB_OUTPUT"
+            echo "Did NOT find exact /start-build"
+          fi
+
+      - name: Extract run_id from issue body
+        if: steps.check.outputs.match == 'true'
+        id: grab
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          echo "== ISSUE BODY START =="
+          printf "%s\n" "$ISSUE_BODY"
+          echo "== ISSUE BODY END =="
+
+          # Expect a line like: **Run ID:** d25473f8-89fa-44a5-b671-f5c4e45249e1
+          RUN_ID=$(echo "$ISSUE_BODY" | sed -n 's/.*Run ID:\s*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
+          if [ -z "$RUN_ID" ]; then
+            echo "Could not find Run ID in issue body"; exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Extracted run_id: $RUN_ID"
