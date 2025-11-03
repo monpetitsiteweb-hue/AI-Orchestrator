@@ -43,10 +43,20 @@ jobs:
           printf "%s\n" "$ISSUE_BODY"
           echo "== ISSUE BODY END =="
 
-          # Expect a line like: **Run ID:** d25473f8-89fa-44a5-b671-f5c4e45249e1
-          RUN_ID=$(echo "$ISSUE_BODY" | sed -n 's/.*Run ID:\s*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
+          # Normalize: remove CR, strip markdown asterisks, collapse spaces
+          CLEAN=$(printf "%s" "$ISSUE_BODY" | tr -d '\r' | sed 's/\*\*//g' | tr -s ' ')
+
+          # Try 1: explicit 'Run ID:' line
+          RUN_ID=$(printf "%s" "$CLEAN" | sed -nE 's/.*Run ID:\s*([0-9a-f-]{36}).*/\1/p' | head -n1)
+
+          # Try 2: first UUID anywhere in the body (fallback)
           if [ -z "$RUN_ID" ]; then
-            echo "Could not find Run ID in issue body"; exit 1
+            RUN_ID=$(printf "%s" "$CLEAN" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -n1)
           fi
-          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$RUN_ID" ]; then
+            echo "Could not find Run ID in issue body (after normalization)"; exit 1
+          fi
+
           echo "Extracted run_id: $RUN_ID"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
