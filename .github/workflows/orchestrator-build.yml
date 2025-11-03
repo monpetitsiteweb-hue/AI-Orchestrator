@@ -60,3 +60,42 @@ jobs:
 
           echo "Extracted run_id: $RUN_ID"
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Post Lovable build brief on the issue
+        if: steps.check.outputs.match == 'true'
+        uses: actions/github-script@v7
+        env:
+          RUN_ID: ${{ steps.grab.outputs.run_id }}
+        with:
+          script: |
+            const runId = process.env.RUN_ID;
+            const body = [
+              `✅ **Build started (manual via Lovable)**`,
+              `**Run ID:** ${runId}`,
+              ``,
+              `**What to do in Lovable:**`,
+              `1. Pull the latest repo.`,
+              `2. Implement the tasks attached to this run in small, testable PRs.`,
+              `3. Keep logs/notes; surface any blockers.`,
+              ``,
+              `_Posted automatically by the Orchestrator_`
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Mark run as in_build (Supabase)
+        if: steps.check.outputs.match == 'true'
+        env:
+          ORCH_MARK_URL: ${{ secrets.ORCH_MARK_URL }}
+          ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
+          RUN_ID: ${{ steps.grab.outputs.run_id }}
+        run: |
+          PAYLOAD=$(jq -n --arg run_id "$RUN_ID" --arg status "in_build" '{run_id:$run_id,status:$status}')
+          curl -sS -X POST "$ORCH_MARK_URL" \
+            -H "content-type: application/json" \
+            -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
+            -d "$PAYLOAD"
