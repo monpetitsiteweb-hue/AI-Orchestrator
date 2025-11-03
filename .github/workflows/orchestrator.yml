@@ -15,23 +15,37 @@ env:
 jobs:
   intake:
     runs-on: ubuntu-latest
-
     steps:
       - name: Show event payload (debug)
         run: |
           echo "$GITHUB_EVENT_PATH"
           cat "$GITHUB_EVENT_PATH"
 
-      - name: Extract run_id & objective from payload
+      - name: Extract run_id & objective (robust)
         id: extract
         run: |
-          RUN_ID=$(jq -r '.client_payload.run_id' "$GITHUB_EVENT_PATH")
+          set -e
+          # Try multiple locations for run_id to be future-proof
+          RUN_ID=$(
+            jq -r '
+              .client_payload.run_id
+              // .client_payload.orchestrator.run_id
+              // empty
+            ' "$GITHUB_EVENT_PATH"
+          )
           if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
-            echo "No run_id in client_payload"; exit 1
+            echo "No run_id found in client_payload"; exit 1
           fi
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
-          OBJ=$(jq -r '.client_payload.objective // "Orchestrator plan"' "$GITHUB_EVENT_PATH")
+          # Try to extract a human objective; accept various locations
+          OBJ=$(
+            jq -r '
+              .client_payload.objective
+              // .client_payload.orchestrator.objective
+              // "Orchestrator plan"
+            ' "$GITHUB_EVENT_PATH"
+          )
           echo "objective=$OBJ" >> "$GITHUB_OUTPUT"
 
       - name: Create Issue (work order)
@@ -63,33 +77,52 @@ jobs:
 
             core.setOutput('issue_number', String(data.number));
 
-      - name: Fetch Judge JSON (final plan) from Supabase
-        id: fetch_plan
+      - name: Build Lovable brief (prefer payload, fallback to Supabase)
+        id: brief
         env:
           RUN_ID: ${{ steps.extract.outputs.run_id }}
+          SUPABASE_URL: ${{ env.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ env.SUPABASE_ANON_KEY }}
         run: |
           set -e
 
-          # Pull the Judge (final merged plan) message for this run.
-          # Using id.desc for ordering (safer than created_at if column absent).
-          URL="${SUPABASE_URL}/rest/v1/orch_messages?run_id=eq.${RUN_ID}&role=eq.judge&select=content_json,id&order=id.desc&limit=1"
+          # 1) Try to get the final Judge JSON directly from the incoming payload
+          jq -e '.client_payload.orchestrator.judge' "$GITHUB_EVENT_PATH" > judge.json || true
 
-          HTTP=$(curl -sS -o judge.json -w "%{http_code}" \
-            -H "apikey: ${SUPABASE_ANON_KEY}" \
-            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
-            "$URL")
+          # 2) If not present, fallback to Supabase (latest judge message)
+          if [ ! -s judge.json ]; then
+            echo "Judge not in payload, fetching from Supabase…"
+            URL="${SUPABASE_URL}/rest/v1/orch_messages?run_id=eq.${RUN_ID}&role=eq.judge&select=content_json,id&order=id.desc&limit=1"
+            HTTP=$(curl -sS -o supa.json -w "%{http_code}" \
+              -H "apikey: ${SUPABASE_ANON_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+              "$URL")
+            echo "Supabase HTTP $HTTP"
+            cat supa.json
 
-          echo "HTTP $HTTP"
-          cat judge.json
+            if [ "$HTTP" -ge 300 ]; then
+              echo "Failed to fetch judge JSON from Supabase"; exit 1
+            fi
 
-          if [ "$HTTP" -ge 300 ]; then
-            echo "Failed to fetch judge JSON"; exit 1
+            jq -e '.[0].content_json' supa.json > judge.json
           fi
 
-          # Extract the plan object (content_json of first row)
-          jq -e '.[0].content_json' judge.json > plan.json
+          # Ensure judge.json is valid JSON
+          jq -e '.' judge.json > /dev/null
 
-          # Build a concise Lovable brief from final_tasks[0] + acceptance[]
+          # Create plan.json in a normalized structure for artifacting
+          # If payload also contains acceptance at top-level, capture it as a hint
+          jq -n \
+            --slurpfile judge judge.json \
+            --slurpfile evt "$GITHUB_EVENT_PATH" \
+            '
+              {
+                judge: $judge[0],
+                payload_acceptance: ($evt[0].client_payload.acceptance // $evt[0].client_payload.orchestrator.acceptance // null)
+              }
+            ' > plan.json
+
+          # Build the Lovable brief from judge.final_tasks[0] + judge.acceptance (fallback to payload_acceptance)
           jq -r '
             def bullets($arr):
               if ($arr|type) == "array" and ($arr|length) > 0
@@ -97,8 +130,9 @@ jobs:
               else "- (none)"
               end;
 
-            . as $p
-            | ($p.final_tasks[0] // {}) as $t
+            . as $root
+            | ($root.judge.final_tasks[0] // {}) as $t
+            | ($root.judge.acceptance // $root.payload_acceptance // []) as $acc
             | (
                 "## Lovable Build Brief",
                 "",
@@ -112,7 +146,7 @@ jobs:
                 (bullets($t.steps)),
                 "",
                 "**Acceptance (must be testable)**",
-                (bullets($p.acceptance)),
+                (bullets($acc)),
                 "",
                 "_Auto-posted from Orchestrator plan_"
               ) | join("\n")
