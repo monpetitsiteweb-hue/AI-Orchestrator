@@ -58,14 +58,13 @@ jobs:
             });
             core.setOutput('issue_number', String(data.number));
 
-      # === IMPORTANT: poll ONLY for final_prompt_markdown written by the 3-AI ===
       - name: Wait for 3-AI merged prompt (runs.final_prompt_markdown)
         id: wait_prompt
         env:
           RUN_ID: ${{ steps.extract.outputs.run_id }}
         run: |
           set -euo pipefail
-          ATTEMPTS=12   # ~60s total
+          ATTEMPTS=12   # ~60s
           SLEEP=5
           for i in $(seq 1 $ATTEMPTS); do
             RESP="$(curl -sS "${SUPABASE_URL}/rest/v1/runs?id=eq.${RUN_ID}&select=final_prompt_markdown" \
@@ -82,7 +81,6 @@ jobs:
             sleep $SLEEP
           done
           echo "Timed out waiting for 3-AI to write runs.final_prompt_markdown for id=${RUN_ID}"
-          echo "Last response:"; echo "$RESP" | jq .
           exit 2
 
       - name: Post Lovable Build Brief (3-AI output)
