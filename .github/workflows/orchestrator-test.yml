@@ -10,63 +10,84 @@ permissions:
 
 jobs:
   run_tests:
-    if: startsWith(github.event.comment.body, '/test')
     runs-on: ubuntu-latest
+
     steps:
-      - name: Extract run_id from issue body (robust)
-      id: extract
-      env:
-        ISSUE_BODY: ${{ github.event.issue.body }}
-      run: |
-        echo "== ISSUE BODY START =="
-        printf "%s\n" "$ISSUE_BODY"
-        echo "== ISSUE BODY END =="
-    
-        # Normalize: remove CR, strip markdown asterisks, collapse spaces
-        CLEAN=$(printf "%s" "$ISSUE_BODY" | tr -d '\r' | sed 's/\*\*//g' | tr -s ' ')
-        echo "== CLEANED BODY =="
-        printf "%s\n" "$CLEAN"
-    
-        # Try 1: explicit 'Run ID:' line (case-insensitive)
-        RUN_ID=$(printf "%s" "$CLEAN" | sed -nE 's/.*[Rr]un[ ]*[Ii][Dd]:[ ]*([0-9a-fA-F-]{36}).*/\1/p' | head -n1)
-    
-        # Try 2: first UUID anywhere
-        if [ -z "$RUN_ID" ]; then
-          RUN_ID=$(printf "%s" "$CLEAN" | grep -oE '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' | head -n1)
-        fi
-    
-        if [ -z "$RUN_ID" ]; then
-          echo "Could not find Run ID in issue body (after normalization)"; exit 1
-        fi
-    
-        echo "Extracted run_id: $RUN_ID"
-        echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-
-
-      - name: Mock smoke test
-        id: mock
-        run: |
-          echo "Running smoke test for run ${{ steps.extract.outputs.run_id }}..."
-          echo "success=true" >> $GITHUB_OUTPUT
-          echo "log=All endpoints returned 200 OK (mock)" >> $GITHUB_OUTPUT
-
-      - name: Report to Supabase
+      - name: Debug comment body
         env:
-          TEST_API: ${{ secrets.ORCH_TEST_URL }}
-          ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
+          BODY: ${{ github.event.comment.body }}
         run: |
-          curl -sS -X POST "$TEST_API" \
-            -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
-            -H "content-type: application/json" \
-            -d "{\"run_id\":\"${{ steps.extract.outputs.run_id }}\",\"test_name\":\"smoke\",\"success\":${{ steps.mock.outputs.success }},\"log\":\"${{ steps.mock.outputs.log }}\"}"
+          echo "=== RAW COMMENT BODY START ==="
+          printf "%s\n" "$BODY"
+          echo "=== RAW COMMENT BODY END ==="
 
-      - name: Comment result
+      - name: Check for /test (exact)
+        id: check
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          if echo "$BODY" | grep -qi '^/test$'; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            echo "Found EXACT /test"
+          else
+            echo "match=false" >> "$GITHUB_OUTPUT"
+            echo "Did NOT find exact /test"
+          fi
+
+      - name: Extract run_id from issue body (robust)
+        if: steps.check.outputs.match == 'true'
+        id: grab
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          echo "== ISSUE BODY START =="
+          printf "%s\n" "$ISSUE_BODY"
+          echo "== ISSUE BODY END =="
+
+          # Normalize: remove CR, strip markdown asterisks, collapse spaces
+          CLEAN=$(printf "%s" "$ISSUE_BODY" | tr -d '\r' | sed 's/\*\*//g' | tr -s ' ')
+          echo "== CLEANED BODY =="
+          printf "%s\n" "$CLEAN"
+
+          # Try 1: explicit 'Run ID:' line (case-insensitive)
+          RUN_ID=$(printf "%s" "$CLEAN" | sed -nE 's/.*[Rr]un[ ]*[Ii][Dd]:[ ]*([0-9a-fA-F-]{36}).*/\1/p' | head -n1)
+
+          # Try 2: first UUID anywhere in the body (fallback)
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID=$(printf "%s" "$CLEAN" | grep -oE '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' | head -n1)
+          fi
+
+          if [ -z "$RUN_ID" ]; then
+            echo "Could not find Run ID in issue body (after normalization)"; exit 1
+          fi
+
+          echo "Extracted run_id: $RUN_ID"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Post test start marker (sanity)
+        if: steps.check.outputs.match == 'true'
         uses: actions/github-script@v7
+        env:
+          RUN_ID: ${{ steps.grab.outputs.run_id }}
         with:
           script: |
+            const runId = process.env.RUN_ID;
+            const body = [
+              `🧪 **Test runner armed**`,
+              ``,
+              `Run ID detected: \`${runId}\``,
+              ``,
+              `_If you see this, /test is wired and run_id extraction works. Now add your real tests in this workflow._`
+            ].join('\n');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `🧪 Smoke test completed for run **${{ steps.extract.outputs.run_id }}** — OK ✅`
+              body
             });
+
+      # === Add your real tests below ===
+      # - name: Run tests here
+      #   run: |
+      #     echo "Call your Supabase function(s) or endpoints with ${{ steps.grab.outputs.run_id }}"
+      #     # e.g., curl your test endpoint and post results
