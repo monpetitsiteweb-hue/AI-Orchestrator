@@ -1,0 +1,171 @@
+name: Orchestrator Complete → Next Cycle
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+  SUPABASE_FUNCTION_URL: ${{ secrets.SUPABASE_FUNCTION_URL }} # e.g. https://<proj>.supabase.co/functions/v1
+  SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+  ORCH_RUN_URL: ${{ secrets.ORCH_RUN_URL }}           # optional override; else we build it
+  ORCH_PROCEED_URL: ${{ secrets.ORCH_PROCEED_URL }}   # optional override; else we build it
+
+jobs:
+  complete_and_spawn:
+    if: startsWith(github.event.comment.body, '/complete-build')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract run_id from issue body
+        id: extract
+        env:
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          RUN_ID=$(printf "%s" "$BODY" | sed -n 's/.*Run ID:\s*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
+          if [ -z "$RUN_ID" ]; then
+            echo "No Run ID found in issue body"; exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch run + last tests
+        id: fetch
+        env:
+          RUN_ID: ${{ steps.extract.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          # run row
+          RUN_JSON="$(curl -sS "${SUPABASE_URL}/rest/v1/runs?id=eq.${RUN_ID}&select=id,objective,status,final_prompt_markdown" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}")"
+          echo "$RUN_JSON" | jq .
+          OBJ="$(echo "$RUN_JSON" | jq -r '.[0].objective // ""')"
+          STAT="$(echo "$RUN_JSON" | jq -r '.[0].status // ""')"
+          PROMPT_LEN="$(echo "$RUN_JSON" | jq -r '.[0].final_prompt_markdown | if type=="string" then length else 0 end')"
+
+          # latest tests for this run
+          TESTS="$(curl -sS "${SUPABASE_URL}/rest/v1/orch_tests?run_id=eq.${RUN_ID}&select=test_name,success,log,created_at&order=created_at.desc&limit=5" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}")"
+
+          echo "objective=$OBJ" >> "$GITHUB_OUTPUT"
+          echo "status=$STAT" >> "$GITHUB_OUTPUT"
+          echo "prompt_len=$PROMPT_LEN" >> "$GITHUB_OUTPUT"
+          printf "%s" "$TESTS" > tests.json
+
+      - name: Synthesize recommendation (simple heuristic)
+        id: rec
+        run: |
+          set -euo pipefail
+          PROMPT_LEN="${{ steps.fetch.outputs.prompt_len }}"
+          # Find plan-only test result if present
+          PLAN_OK=$(jq -r '[.[] | select(.test_name=="plan_only")][0].success // empty' tests.json)
+          EXEC_OK=$(jq -r '[.[] | select(.test_name=="execute_wrap")][0].success // empty' tests.json)
+
+          NEXT_OBJ=""
+          NEXT_CTX=""
+
+          if [ -z "$PROMPT_LEN" ] || [ "$PROMPT_LEN" = "0" ]; then
+            NEXT_OBJ="Task 5.1 — Re-run Judge to emit final Lovable prompt"
+            NEXT_CTX="Judge failed to include final_prompt_markdown. Re-run Architect→Skeptic→Judge with the strict schema requiring final_prompt_markdown."
+          elif [ "$PLAN_OK" = "true" ] && [ "$EXEC_OK" != "true" ]; then
+            NEXT_OBJ="Task 5.2 — Integrate ensure-weth into BUY preflight (plan-only, no on-chain)"
+            NEXT_CTX="Plan-only /wallet-ensure-weth passed. Next: wire ensure-weth into the BUY preflight path (still no on-chain), preserve API contract and logging keys, add mocks so /test can validate the preflight path deterministically. Lovable MUST first check the high-level plan and confirm this step fits before coding; if not, propose the correct next step."
+          elif [ "$PLAN_OK" != "true" ]; then
+            NEXT_OBJ="Task 5.1 — Fix /wallet-ensure-weth plan-only contract"
+            NEXT_CTX="Plan-only failed. Bring /wallet-ensure-weth to spec (API schema, error codes, logging keys). Lovable MUST check the high-level plan and confirm this is the right step; otherwise propose the correct step with reasoning."
+          else
+            NEXT_OBJ="Task 5.x — Continue per plan"
+            NEXT_CTX="All tests green for current scope. Propose the next most valuable step, validate against the high-level plan first, then implement."
+          fi
+
+          echo "next_obj=$NEXT_OBJ" >> "$GITHUB_OUTPUT"
+          printf "%s" "$NEXT_CTX" > next_ctx.txt
+
+      - name: Create next 3-AI run (orchestrator-run)
+        id: run
+        env:
+          NEXT_OBJ: ${{ steps.rec.outputs.next_obj }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ORCH_RUN_URL}" ]; then
+            ORCH_RUN="${SUPABASE_FUNCTION_URL}/orchestrator-run"
+          else
+            ORCH_RUN="${ORCH_RUN_URL}"
+          fi
+          BODY=$(jq -n --arg obj "$NEXT_OBJ" --rawfile ctx next_ctx.txt '{objective:$obj, context:$ctx}')
+          RESP=$(curl -sS -X POST "$ORCH_RUN" \
+            -H "authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            -H "content-type: application/json" \
+            -d "$BODY")
+          echo "$RESP"
+          NEW_ID=$(echo "$RESP" | jq -r '.run_id // empty')
+          if [ -z "$NEW_ID" ]; then echo "No run_id from orchestrator-run"; exit 1; fi
+          echo "new_run_id=$NEW_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Open next issue (plan intake)
+        id: intake
+        env:
+          NEW_ID: ${{ steps.run.outputs.new_run_id }}
+          OBJ: ${{ steps.rec.outputs.next_obj }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ORCH_PROCEED_URL}" ]; then
+            ORCH_PROCEED="${SUPABASE_FUNCTION_URL}/orchestrator-proceed"
+          else
+            ORCH_PROCEED="${ORCH_PROCEED_URL}"
+          fi
+          BODY=$(jq -n --arg id "$NEW_ID" '{run_id:$id, event_type:"orchestrator_plan_ready"}')
+          curl -sS -X POST "$ORCH_PROCEED" \
+            -H "authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            -H "content-type: application/json" \
+            -d "$BODY" \
+            | jq .
+
+      - name: Comment recap on current issue
+        uses: actions/github-script@v7
+        env:
+          RUN_ID: ${{ steps.extract.outputs.run_id }}
+          OBJ: ${{ steps.fetch.outputs.objective }}
+          STAT: ${{ steps.fetch.outputs.status }}
+        with:
+          script: |
+            const fs = require('fs');
+            const tests = JSON.parse(fs.readFileSync('tests.json', 'utf8'));
+            const plan = tests.find(t => t.test_name === 'plan_only');
+            const exec = tests.find(t => t.test_name === 'execute_wrap');
+
+            const nextId = "${{ steps.run.outputs.new_run_id }}";
+            const nextObj = "${{ steps.rec.outputs.next_obj }}";
+            const recCtx = fs.readFileSync('next_ctx.txt','utf8');
+
+            const lines = [];
+            lines.push(`**Build completed for run ${process.env.RUN_ID}**`);
+            lines.push('');
+            lines.push(`- Objective: ${process.env.OBJ}`);
+            lines.push(`- Status: ${process.env.STAT}`);
+            lines.push('');
+            lines.push(`**Tests (latest)**`);
+            lines.push(`• plan_only: ${plan?.success === true ? '✅' : (plan?.success === false ? '❌' : '—')}`);
+            if (plan?.log) lines.push(`  ↳ ${plan.log}`);
+            lines.push(`• execute_wrap: ${exec?.success === true ? '✅' : (exec?.success === false ? '❌' : '⏭️')}`);
+            if (exec?.log) lines.push(`  ↳ ${exec.log}`);
+            lines.push('');
+            lines.push(`**Recommendation**`);
+            lines.push(`- ${nextObj}`);
+            lines.push('');
+            lines.push(`**Lovable must first check the high-level plan** and confirm this recommendation fits. If not, it should propose the correct next step with reasoning.`);
+            lines.push('');
+            lines.push(`Next run created: **${nextId}** (a new issue will appear shortly).`);
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: lines.join('\n')
+            });
