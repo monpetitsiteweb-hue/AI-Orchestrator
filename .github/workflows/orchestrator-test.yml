@@ -81,14 +81,13 @@ jobs:
           set -euo pipefail
           BODY=$(jq -n --arg addr "0x0000000000000000000000000000000000000000" --arg min "0" --argjson wrap false \
             '{address:$addr, minWethNeededWei:$min, autoWrap:$wrap}' )
-          # We just need the endpoint to respond sanely; the address/min are placeholders for plan-only.
+
           HTTP=$(curl -sS -w "%{http_code}" -o resp.json -X POST "${EXEC_BASE_URL}/wallet-ensure-weth" \
             -H "content-type: application/json" \
+            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
             -d "$BODY")
-
           echo "HTTP=$HTTP"
           cat resp.json || true
-
           if [ "$HTTP" = "200" ]; then
             OK=$(jq -r '.ok // false' resp.json)
             ACTION=$(jq -r '.action // empty' resp.json)
@@ -98,7 +97,6 @@ jobs:
               exit 0
             fi
           fi
-
           echo "ok=false" >> "$GITHUB_OUTPUT"
           if [ -f resp.json ]; then
             MSG=$(jq -r '.error // .message // empty' resp.json)
@@ -106,12 +104,12 @@ jobs:
           fi
           exit 0
 
+
       - name: Execute test — POST /wallet-ensure-weth (autoWrap=true)
         id: exec_wrap
         if: ${{ env.EXEC_BASE_URL != '' && env.ALLOW_WRAP == 'true' }}
         run: |
           set -euo pipefail
-          # NOTE: This expects your server signer + BOT_ADDRESS to be configured in Supabase (function secrets)
           BODY=$(jq -n \
             --arg addr "${{ secrets.BOT_ADDRESS }}" \
             --arg min  "1000000000000000" \
@@ -121,11 +119,10 @@ jobs:
 
           HTTP=$(curl -sS -w "%{http_code}" -o resp.json -X POST "${EXEC_BASE_URL}/wallet-ensure-weth" \
             -H "content-type: application/json" \
+            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
             -d "$BODY")
-
           echo "HTTP=$HTTP"
           cat resp.json || true
-
           if [ "$HTTP" = "200" ]; then
             OK=$(jq -r '.ok // false' resp.json)
             TX=$(jq -r '.txHash // empty' resp.json)
@@ -135,13 +132,13 @@ jobs:
               exit 0
             fi
           fi
-
           CODE=$(jq -r '.code // empty' resp.json)
           MSG=$(jq -r '.error // .message // empty' resp.json)
           echo "ok=false" >> "$GITHUB_OUTPUT"
           echo "code=$CODE" >> "$GITHUB_OUTPUT"
           echo "msg=$MSG" >> "$GITHUB_OUTPUT"
           exit 0
+
 
       - name: Persist test result to Supabase (optional)
         if: ${{ env.ORCH_TEST_URL != '' && env.ORCH_ADMIN_SECRET != '' }}
