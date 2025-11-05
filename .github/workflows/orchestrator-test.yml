@@ -13,16 +13,35 @@ jobs:
     if: startsWith(github.event.comment.body, '/test')
     runs-on: ubuntu-latest
     steps:
-      - name: Extract run_id
-        id: extract
-        env:
-          BODY: ${{ github.event.issue.body }}
-        run: |
-          RUN_ID=$(echo "$BODY" | sed -n 's/.*Run ID:\s*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
-          if [ -z "$RUN_ID" ]; then
-            echo "No Run ID found in issue body"; exit 1
-          fi
-          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+    - name: Extract run_id from issue body (robust)
+      id: extract
+      env:
+        ISSUE_BODY: ${{ github.event.issue.body }}
+      run: |
+        echo "== ISSUE BODY START =="
+        printf "%s\n" "$ISSUE_BODY"
+        echo "== ISSUE BODY END =="
+    
+        # Normalize: remove CR, strip markdown asterisks, collapse spaces
+        CLEAN=$(printf "%s" "$ISSUE_BODY" | tr -d '\r' | sed 's/\*\*//g' | tr -s ' ')
+        echo "== CLEANED BODY =="
+        printf "%s\n" "$CLEAN"
+    
+        # Try 1: explicit 'Run ID:' line (case-insensitive)
+        RUN_ID=$(printf "%s" "$CLEAN" | sed -nE 's/.*[Rr]un[ ]*[Ii][Dd]:[ ]*([0-9a-fA-F-]{36}).*/\1/p' | head -n1)
+    
+        # Try 2: first UUID anywhere
+        if [ -z "$RUN_ID" ]; then
+          RUN_ID=$(printf "%s" "$CLEAN" | grep -oE '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' | head -n1)
+        fi
+    
+        if [ -z "$RUN_ID" ]; then
+          echo "Could not find Run ID in issue body (after normalization)"; exit 1
+        fi
+    
+        echo "Extracted run_id: $RUN_ID"
+        echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
 
       - name: Mock smoke test
         id: mock
