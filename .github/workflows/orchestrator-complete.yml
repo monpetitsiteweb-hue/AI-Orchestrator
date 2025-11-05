@@ -1,4 +1,4 @@
-name: Orchestrator: Plan Complete Trigger
+name: "Orchestrator: Plan Complete Trigger"
 
 on:
   issue_comment:
@@ -19,6 +19,7 @@ jobs:
   complete:
     if: startsWith(github.event.comment.body, '/complete-build')
     runs-on: ubuntu-latest
+
     steps:
       - name: Debug comment
         env:
@@ -115,7 +116,6 @@ jobs:
           OBJ=$(jq -r '.[0].objective' run.json)
           CTX=$(jq -r '.[0].context // ""' run.json)
 
-          # Build a remediation context from failing tests
           echo "### Previous Objective" > next_context.md
           echo "$OBJ" >> next_context.md
           echo >> next_context.md
@@ -137,7 +137,6 @@ EOF
           echo "REM_CTX:"
           cat next_context.md
 
-          # Ask the orchestrator to produce a NEW run with a new Lovable prompt
           JSON=$(jq -n --arg obj "Remediate failing tests for: ${OBJ}" --slurpfile ctx next_context.md '{objective:$obj, context:($ctx|join(""))}')
           curl -sS -X POST \
             "${SUPABASE_URL}/functions/v1/orchestrator-run" \
