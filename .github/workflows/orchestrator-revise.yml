@@ -1,0 +1,125 @@
+name: Orchestrator Revision Intake
+
+on:
+  repository_dispatch:
+    types: [orchestrator_revision_ready]
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+  AUTO_START_BUILD_ON_REVISION: ${{ secrets.AUTO_START_BUILD_ON_REVISION }} # "true" to auto /start-build
+
+jobs:
+  revision:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show event payload (debug)
+        run: |
+          echo "=== RAW EVENT JSON START ==="
+          cat "$GITHUB_EVENT_PATH"
+          echo "=== RAW EVENT JSON END ==="
+
+      - name: Extract run_id
+        id: extract
+        run: |
+          set -euo pipefail
+          RUN_ID=$(jq -r '.client_payload.run_id // empty' "$GITHUB_EVENT_PATH")
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "No run_id in payload"; exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Find issue by title
+        id: find_issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = "${{ steps.extract.outputs.run_id }}";
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+            const title = `Orchestrator: Plan for ${runId}`;
+            const hit = issues.find(i => i.title === title);
+            if (!hit) core.setFailed(`Issue not found for run ${runId}`);
+            core.setOutput('issue_number', String(hit.number));
+
+      - name: Wait for updated runs.final_prompt_markdown
+        id: wait_prompt
+        env:
+          RUN_ID: ${{ steps.extract.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          ATTEMPTS=12
+          SLEEP=5
+          for i in $(seq 1 $ATTEMPTS); do
+            RESP="$(curl -sS "${SUPABASE_URL}/rest/v1/runs?id=eq.${RUN_ID}&select=final_prompt_markdown" \
+              -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
+              -H "Accept: application/json")"
+            PROMPT="$(echo "$RESP" | jq -r '.[0].final_prompt_markdown // empty')"
+            if [ -n "$PROMPT" ]; then
+              printf "%s\n" "$PROMPT" > lovable_revision.md
+              echo "prompt_path=lovable_revision.md" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Revised prompt not ready yet (attempt $i/$ATTEMPTS); sleeping ${SLEEP}s…"
+            sleep $SLEEP
+          done
+          echo "Timed out waiting for revised prompt"; exit 2
+
+      - name: Count previous revision comments (guardrail)
+        id: count_revisions
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue_number = parseInt("${{ steps.find_issue.outputs.issue_number }}", 10);
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              per_page: 100
+            });
+            const count = comments.filter(c => /Revise build prompt/i.test(c.body || '')).length;
+            core.setOutput('count', String(count));
+
+      - name: Post revised Lovable prompt
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
+          PROMPT_PATH: ${{ steps.wait_prompt.outputs.prompt_path }}
+        with:
+          script: |
+            const fs = require('fs');
+            const issue_number = parseInt(process.env.ISSUE_NUMBER, 10);
+            const body = [
+              "🔁 **Revise build prompt**",
+              "",
+              fs.readFileSync(process.env.PROMPT_PATH, 'utf8')
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body
+            });
+
+      - name: Auto /start-build (optional)
+        if: env.AUTO_START_BUILD_ON_REVISION == 'true' && steps.count_revisions.outputs.count < '3'
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt(process.env.ISSUE_NUMBER, 10),
+              body: "/start-build"
+            });
