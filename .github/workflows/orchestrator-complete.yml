@@ -35,7 +35,19 @@ jobs:
           BODY: ${{ github.event.issue.body }}
         run: |
           set -euo pipefail
-          RUN_ID=$(printf "%s" "$BODY" | sed -n 's/.*Run ID:\s*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
+          echo "=== ISSUE BODY START ==="
+          printf '%s\n' "$BODY"
+          echo "=== ISSUE BODY END ==="
+
+          # Normalize CRLF and strip markdown asterisks so patterns are robust
+          CLEAN="$(printf '%s\n' "$BODY" | tr -d '\r' | sed 's/\*\*//g')"
+
+          # Extract the first UUID after the literal text "Run ID:"
+          RUN_ID="$(printf '%s\n' "$CLEAN" \
+            | grep -oE 'Run ID:[[:space:]]*[0-9a-fA-F-]{36}' \
+            | head -n1 \
+            | sed -E 's/.*Run ID:[[:space:]]*//')"
+
           if [ -z "$RUN_ID" ]; then
             echo "No Run ID found in issue body"; exit 1
           fi
