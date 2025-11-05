@@ -129,10 +129,10 @@ jobs:
 
           echo "### Constraints" >> next_context.md
           cat <<'EOF' >> next_context.md
-- Scope strictly limited to fixing the failing tests listed above.
-- Keep existing endpoints and error taxonomy unchanged.
-- Produce a Lovable-ready build prompt with exact files, steps, and a 6-case test plan.
-EOF
+          - Scope strictly limited to fixing the failing tests listed above.
+          - Keep existing endpoints and error taxonomy unchanged.
+          - Produce a Lovable-ready build prompt with exact files, steps, and a 6-case test plan.
+          EOF
 
           echo "REM_CTX:"
           cat next_context.md
