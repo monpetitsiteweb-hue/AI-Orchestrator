@@ -10,33 +10,23 @@ permissions:
 
 jobs:
   run_tests:
+    if: startsWith(github.event.comment.body, '/test')
     runs-on: ubuntu-latest
-
+    env:
+      # --- Supabase REST (to read runs.final_prompt_markdown) ---
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+      # --- Result sink (edge function that records tests) ---
+      ORCH_TEST_URL: ${{ secrets.ORCH_TEST_URL }}
+      ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
+      # --- Optional: real endpoint tests (wallet-ensure-weth) ---
+      EXEC_BASE_URL: ${{ secrets.EXEC_BASE_URL }}            # e.g. https://<proj>.supabase.co/functions/v1
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}    # bearer for Functions
+      BOT_ADDRESS: ${{ secrets.BOT_ADDRESS }}                # taker/bot wallet
+      ALLOW_WRAP: ${{ secrets.ALLOW_WRAP }}                  # set to "true" to allow autoWrap test
     steps:
-      - name: Debug comment body
-        env:
-          BODY: ${{ github.event.comment.body }}
-        run: |
-          echo "=== RAW COMMENT BODY START ==="
-          printf "%s\n" "$BODY"
-          echo "=== RAW COMMENT BODY END ==="
-
-      - name: Check for /test (exact)
-        id: check
-        env:
-          BODY: ${{ github.event.comment.body }}
-        run: |
-          if echo "$BODY" | grep -qi '^/test$'; then
-            echo "match=true" >> "$GITHUB_OUTPUT"
-            echo "Found EXACT /test"
-          else
-            echo "match=false" >> "$GITHUB_OUTPUT"
-            echo "Did NOT find exact /test"
-          fi
-
       - name: Extract run_id from issue body (robust)
-        if: steps.check.outputs.match == 'true'
-        id: grab
+        id: extract
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
@@ -44,50 +34,168 @@ jobs:
           printf "%s\n" "$ISSUE_BODY"
           echo "== ISSUE BODY END =="
 
-          # Normalize: remove CR, strip markdown asterisks, collapse spaces
+          # Normalize: strip CR, markdown **, collapse spaces
           CLEAN=$(printf "%s" "$ISSUE_BODY" | tr -d '\r' | sed 's/\*\*//g' | tr -s ' ')
-          echo "== CLEANED BODY =="
-          printf "%s\n" "$CLEAN"
-
-          # Try 1: explicit 'Run ID:' line (case-insensitive)
+          # Try explicit 'Run ID:' first (case-insensitive)
           RUN_ID=$(printf "%s" "$CLEAN" | sed -nE 's/.*[Rr]un[ ]*[Ii][Dd]:[ ]*([0-9a-fA-F-]{36}).*/\1/p' | head -n1)
-
-          # Try 2: first UUID anywhere in the body (fallback)
+          # Fallback: first UUID anywhere
           if [ -z "$RUN_ID" ]; then
             RUN_ID=$(printf "%s" "$CLEAN" | grep -oE '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' | head -n1)
           fi
-
           if [ -z "$RUN_ID" ]; then
             echo "Could not find Run ID in issue body (after normalization)"; exit 1
           fi
-
           echo "Extracted run_id: $RUN_ID"
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Post test start marker (sanity)
-        if: steps.check.outputs.match == 'true'
+      # ---------- Test 1: 3-AI prompt exists in runs.final_prompt_markdown ----------
+      - name: Check 3-AI merged prompt presence
+        id: prompt_check
+        run: |
+          set -euo pipefail
+          if [ -z "${SUPABASE_URL:-}" ] || [ -z "${SUPABASE_SERVICE_ROLE:-}" ]; then
+            echo "have_prompt=false" >> "$GITHUB_OUTPUT"
+            echo "log=Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE; cannot check prompt" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RESP="$(curl -sS "${SUPABASE_URL}/rest/v1/runs?id=eq.${{ steps.extract.outputs.run_id }}&select=final_prompt_markdown" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
+            -H "Accept: application/json")" || true
+
+          PROMPT_LEN=$(echo "$RESP" | jq -r '.[0].final_prompt_markdown // ""' | wc -c | tr -d ' ')
+          if [ "$PROMPT_LEN" -gt 20 ]; then
+            echo "have_prompt=true" >> "$GITHUB_OUTPUT"
+            echo "log=final_prompt_markdown present (len=${PROMPT_LEN})" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_prompt=false" >> "$GITHUB_OUTPUT"
+            echo "log=final_prompt_markdown missing/empty" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record Test 1 → Supabase
+        if: env.ORCH_TEST_URL != '' && env.ORCH_ADMIN_SECRET != ''
+        run: |
+          curl -sS -X POST "$ORCH_TEST_URL" \
+            -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
+            -H "content-type: application/json" \
+            -d "{\"run_id\":\"${{ steps.extract.outputs.run_id }}\",\"test_name\":\"prompt_present\",\"success\":${{ steps.prompt_check.outputs.have_prompt == 'true' && 'true' || 'false' }},\"log\":\"${{ steps.prompt_check.outputs.log }}\"}" >/dev/null || true
+
+      # ---------- Test 2: Plan-only path of /wallet-ensure-weth ----------
+      - name: Plan-only call to /wallet-ensure-weth (autoWrap=false)
+        id: plan_only
+        run: |
+          set -euo pipefail
+          # Skip if any of required vars is missing
+          for v in EXEC_BASE_URL SUPABASE_ANON_KEY BOT_ADDRESS; do
+            eval "val=\${$v:-}"
+            if [ -z "$val" ]; then
+              echo "ok=false" >> "$GITHUB_OUTPUT"
+              echo "log=Missing $v; skipping endpoint test" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          BODY=$(jq -n --arg addr "$BOT_ADDRESS" '{address:$addr, minWethNeededWei:"1000000000000", autoWrap:false, maxWaitMs:5000}')
+          HTTP=$(curl -sS -o resp.json -w "%{http_code}" -X POST "${EXEC_BASE_URL}/wallet-ensure-weth" \
+            -H "authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            -H "content-type: application/json" \
+            --data "$BODY")
+
+          # Accept 200 only; validate shape
+          if [ "$HTTP" != "200" ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "log=HTTP $HTTP calling /wallet-ensure-weth (autoWrap=false)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          OK=$(jq -r '.ok // false' resp.json)
+          ACTION=$(jq -r '.action // ""' resp.json)
+          if [ "$OK" = "true" ] && { [ "$ACTION" = "none" ] || [ "$ACTION" = "wrap" ]; }; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "log=Plan-only OK (action=${ACTION})" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "log=Unexpected response shape: $(cat resp.json | tr -d '\n' | head -c 300)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record Test 2 → Supabase
+        if: env.ORCH_TEST_URL != '' && env.ORCH_ADMIN_SECRET != ''
+        run: |
+          curl -sS -X POST "$ORCH_TEST_URL" \
+            -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
+            -H "content-type: application/json" \
+            -d "{\"run_id\":\"${{ steps.extract.outputs.run_id }}\",\"test_name\":\"ensure_weth_plan_only\",\"success\":${{ steps.plan_only.outputs.ok == 'true' && 'true' || 'false' }},\"log\":\"${{ steps.plan_only.outputs.log }}\"}" >/dev/null || true
+
+      # ---------- Test 3 (optional): Execute wrap path (autoWrap=true) ----------
+      - name: Execute call to /wallet-ensure-weth (autoWrap=true) [optional]
+        id: exec_wrap
+        if: env.ALLOW_WRAP == 'true'
+        run: |
+          set -euo pipefail
+          for v in EXEC_BASE_URL SUPABASE_ANON_KEY BOT_ADDRESS; do
+            eval "val=\${$v:-}"
+            if [ -z "$val" ]; then
+              echo "ok=false" >> "$GITHUB_OUTPUT"
+              echo "log=Missing $v; skipping execute test" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          # Ask just slightly above 0 to minimize effect; service enforces address==BOT_ADDRESS
+          BODY=$(jq -n --arg addr "$BOT_ADDRESS" '{address:$addr, minWethNeededWei:"2000000000000", autoWrap:true, maxWaitMs:10000}')
+          HTTP=$(curl -sS -o resp_exec.json -w "%{http_code}" -X POST "${EXEC_BASE_URL}/wallet-ensure-weth" \
+            -H "authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            -H "content-type: application/json" \
+            --data "$BODY")
+
+          if [ "$HTTP" = "200" ]; then
+            OK=$(jq -r '.ok // false' resp_exec.json)
+            ACTION=$(jq -r '.action // ""' resp_exec.json)
+            if [ "$OK" = "true" ] && { [ "$ACTION" = "wrap" ] || [ "$ACTION" = "pending" ]; }; then
+              echo "ok=true" >> "$GITHUB_OUTPUT"
+              H=$(jq -r '.txHash // ""' resp_exec.json)
+              GU=$(jq -r '.gasUsed // 0' resp_exec.json)
+              echo "log=Execute OK (action=${ACTION}, txHash=${H}, gasUsed=${GU})" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # Accept known error taxonomy as informative (not success)
+          CODE=$(jq -r '.code // ""' resp_exec.json)
+          MSG=$(jq -r '.message // ""' resp_exec.json)
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+          echo "log=HTTP ${HTTP} execute result code=${CODE} msg=${MSG}" >> "$GITHUB_OUTPUT"
+
+      - name: Record Test 3 → Supabase
+        if: env.ORCH_TEST_URL != '' && env.ORCH_ADMIN_SECRET != '' && steps.exec_wrap.outcome != 'skipped'
+        run: |
+          curl -sS -X POST "$ORCH_TEST_URL" \
+            -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
+            -H "content-type: application/json" \
+            -d "{\"run_id\":\"${{ steps.extract.outputs.run_id }}\",\"test_name\":\"ensure_weth_execute\",\"success\":${{ steps.exec_wrap.outputs.ok == 'true' && 'true' || 'false' }},\"log\":\"${{ steps.exec_wrap.outputs.log }}\"}" >/dev/null || true
+
+      # ---------- Final summary comment ----------
+      - name: Comment summary
         uses: actions/github-script@v7
-        env:
-          RUN_ID: ${{ steps.grab.outputs.run_id }}
         with:
           script: |
-            const runId = process.env.RUN_ID;
-            const body = [
-              `🧪 **Test runner armed**`,
-              ``,
-              `Run ID detected: \`${runId}\``,
-              ``,
-              `_If you see this, /test is wired and run_id extraction works. Now add your real tests in this workflow._`
-            ].join('\n');
+            const lines = [];
+            lines.push(`🧪 **Test summary for run \`${{ steps.extract.outputs.run_id }}\`**`);
+            lines.push('');
+            lines.push(`• Prompt present: **${{ steps.prompt_check.outputs.have_prompt || 'false' }}** — ${ {true:'✅', false:'❌'}[('${{ steps.prompt_check.outputs.have_prompt }}'==='true')] }`);
+            lines.push(`  ↳ ${ String.raw`${{ steps.prompt_check.outputs.log || '' }}` }`);
+            lines.push(`• Plan-only /wallet-ensure-weth: **${{ steps.plan_only.outputs.ok || 'false' }}** — ${ {true:'✅', false:'❌'}[('${{ steps.plan_only.outputs.ok }}'==='true')] }`);
+            lines.push(`  ↳ ${ String.raw`${{ steps.plan_only.outputs.log || '' }}` }`);
+            if ("${{ steps.exec_wrap.outcome }}" !== "skipped") {
+              lines.push(`• Execute /wallet-ensure-weth (autoWrap=true): **${{ steps.exec_wrap.outputs.ok || 'false' }}** — ${ {true:'✅', false:'❌'}[('${{ steps.exec_wrap.outputs.ok }}'==='true')] }`);
+              lines.push(`  ↳ ${ String.raw`${{ steps.exec_wrap.outputs.log || '' }}` }`);
+            } else {
+              lines.push(`• Execute /wallet-ensure-weth: _skipped_ (set secret **ALLOW_WRAP=true** to enable)`);
+            }
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body
+              body: lines.join('\n')
             });
-
-      # === Add your real tests below ===
-      # - name: Run tests here
-      #   run: |
-      #     echo "Call your Supabase function(s) or endpoints with ${{ steps.grab.outputs.run_id }}"
-      #     # e.g., curl your test endpoint and post results
