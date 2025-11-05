@@ -2,7 +2,7 @@ name: Orchestrator Test Runner
 
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited]
 
 permissions:
   contents: read
@@ -18,9 +18,15 @@ env:
 
 jobs:
   run_tests:
-    if: startsWith(github.event.comment.body, '/test')
+    if: startsWith((github.event.comment.body || '') , '/test')
     runs-on: ubuntu-latest
     steps:
+      - name: Debug comment body
+        run: |
+          echo "=== RAW COMMENT BODY ==="
+          printf "%s\n" "${{ github.event.comment.body }}"
+          echo "========================"
+            
       - name: Extract run_id (robust)
         id: extract
         env:
