@@ -1,19 +1,26 @@
-name: Orchestrator Complete Trigger
+name: Orchestrator: Plan Complete Trigger
 
 on:
   issue_comment:
-    types: [created, edited]
+    types: [created]
 
 permissions:
   contents: read
   issues: write
 
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+  SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+  ORCH_MARK_URL: ${{ secrets.ORCH_MARK_URL }}
+  ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
+
 jobs:
-  complete_build:
-    if: github.event_name == 'issue_comment' && contains(github.event.comment.body, '/complete-build')
+  complete:
+    if: startsWith(github.event.comment.body, '/complete-build')
     runs-on: ubuntu-latest
     steps:
-      - name: Debug comment body
+      - name: Debug comment
         env:
           BODY: ${{ github.event.comment.body }}
         run: |
@@ -21,65 +28,201 @@ jobs:
           printf "%s\n" "$BODY"
           echo "=== RAW COMMENT BODY END ==="
 
-      - name: Check for /complete-build
-        id: check
-        env:
-          BODY: ${{ github.event.comment.body }}
-        run: |
-          if echo "$BODY" | grep -qi '^/complete-build$'; then
-            echo "match=true" >> "$GITHUB_OUTPUT"
-            echo "Found EXACT /complete-build"
-          else
-            echo "match=false" >> "$GITHUB_OUTPUT"
-            echo "Did NOT find exact /complete-build"
-          fi
-
       - name: Extract run_id from issue body
-        if: steps.check.outputs.match == 'true'
-        id: grab
+        id: extract
         env:
-          ISSUE_BODY: ${{ github.event.issue.body }}
+          BODY: ${{ github.event.issue.body }}
         run: |
-          CLEAN=$(printf "%s" "$ISSUE_BODY" | tr -d '\r' | sed 's/\*\*//g' | tr -s ' ')
-          RUN_ID=$(printf "%s" "$CLEAN" | sed -nE 's/.*Run ID:\s*([0-9a-f-]{36}).*/\1/p' | head -n1)
+          set -euo pipefail
+          RUN_ID=$(printf "%s" "$BODY" | sed -n 's/.*Run ID:\s*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
           if [ -z "$RUN_ID" ]; then
-            RUN_ID=$(printf "%s" "$CLEAN" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -n1)
-          fi
-          if [ -z "$RUN_ID" ]; then
-            echo "Could not find Run ID in issue body"; exit 1
+            echo "No Run ID found in issue body"; exit 1
           fi
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "Extracted run_id: $RUN_ID"
 
-      - name: Mark run as built (Supabase)
-        if: steps.check.outputs.match == 'true'
+      - name: Fetch test rows from Supabase (orch_tests + runs)
+        id: fetch
         env:
-          ORCH_MARK_URL: ${{ secrets.ORCH_MARK_URL }}
-          ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          RUN_ID: ${{ steps.grab.outputs.run_id }}
+          RUN_ID: ${{ steps.extract.outputs.run_id }}
         run: |
-          set -e
-          PAYLOAD=$(jq -n --arg run_id "$RUN_ID" --arg status "built" '{run_id:$run_id,status:$status}')
-          HTTP_CODE=$(curl -sS -o resp.txt -w "%{http_code}" -X POST "$ORCH_MARK_URL" \
-            -H "content-type: application/json" \
-            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
-            -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
-            -d "$PAYLOAD")
-          echo "HTTP $HTTP_CODE"
-          cat resp.txt || true
-          if [ "$HTTP_CODE" -ge 300 ]; then
-            echo "Mark endpoint failed (HTTP $HTTP_CODE)"; exit 1
-          fi
+          set -euo pipefail
 
-      - name: Trigger tests by commenting /test
-        if: steps.check.outputs.match == 'true'
+          # Latest tests for this run
+          curl -sS "${SUPABASE_URL}/rest/v1/orch_tests?run_id=eq.${RUN_ID}&select=created_at,test_name,success,log&order=created_at.desc" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
+            -H "Accept: application/json" > tests.json
+
+          # Run meta (objective + optional context and final prompt)
+          curl -sS "${SUPABASE_URL}/rest/v1/runs?id=eq.${RUN_ID}&select=objective,context,final_prompt_markdown,status" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
+            -H "Accept: application/json" > run.json
+
+          echo "Tests:"
+          cat tests.json
+          echo
+          echo "Run:"
+          cat run.json
+
+          FAILS=$(jq '[ .[] | select(.success==false) ] | length' tests.json)
+          PASSES=$(jq '[ .[] | select(.success==true) ] | length' tests.json)
+          echo "fails=$FAILS" >> "$GITHUB_OUTPUT"
+          echo "passes=$PASSES" >> "$GITHUB_OUTPUT"
+
+      - name: Post human summary of the test results
         uses: actions/github-script@v7
+        env:
+          RUN_ID: ${{ steps.extract.outputs.run_id }}
         with:
           script: |
+            const fs = require('fs');
+            const tests = JSON.parse(fs.readFileSync('tests.json','utf8'));
+            const run = JSON.parse(fs.readFileSync('run.json','utf8'))[0] || {};
+            const lines = [];
+            lines.push(`🧪 **Test summary for run ${process.env.RUN_ID}**`);
+            if (!Array.isArray(tests) || tests.length === 0) {
+              lines.push('');
+              lines.push('_No tests recorded for this run yet._');
+            } else {
+              for (const t of tests.slice(0,10).reverse()) {
+                const ok = t.success ? '✅' : '❌';
+                const log = (t.log || '').toString().slice(0, 400);
+                lines.push(`• ${t.test_name}: ${ok}`);
+                if (log) lines.push(`  ↳ ${log}`);
+              }
+              if (tests.length > 10) {
+                lines.push(`_…and ${tests.length-10} more entries_`);
+              }
+            }
+            lines.push('');
+            lines.push(`Status: **${run.status || 'unknown'}**`);
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '/test'
-            })
+              body: lines.join('\n')
+            });
+
+      - name: If failures exist, create a follow-up 3-AI run for remediation
+        id: remediate
+        if: ${{ steps.fetch.outputs.fails != '0' }}
+        env:
+          RUN_ID: ${{ steps.extract.outputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          OBJ=$(jq -r '.[0].objective' run.json)
+          CTX=$(jq -r '.[0].context // ""' run.json)
+
+          # Build a remediation context from failing tests
+          echo "### Previous Objective" > next_context.md
+          echo "$OBJ" >> next_context.md
+          echo >> next_context.md
+
+          echo "### Current Failures (first 10)" >> next_context.md
+          jq -r '
+            [ .[] | select(.success==false) ][0:10]
+            | map("* " + .test_name + " — log: " + ((.log|tostring)|gsub("\n"; " ")|.[:400]))[]
+          ' tests.json >> next_context.md
+          echo >> next_context.md
+
+          echo "### Constraints" >> next_context.md
+          cat <<'EOF' >> next_context.md
+- Scope strictly limited to fixing the failing tests listed above.
+- Keep existing endpoints and error taxonomy unchanged.
+- Produce a Lovable-ready build prompt with exact files, steps, and a 6-case test plan.
+EOF
+
+          echo "REM_CTX:"
+          cat next_context.md
+
+          # Ask the orchestrator to produce a NEW run with a new Lovable prompt
+          JSON=$(jq -n --arg obj "Remediate failing tests for: ${OBJ}" --slurpfile ctx next_context.md '{objective:$obj, context:($ctx|join(""))}')
+          curl -sS -X POST \
+            "${SUPABASE_URL}/functions/v1/orchestrator-run" \
+            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            -H "content-type: application/json" \
+            -d "$JSON" > new_run.json
+
+          echo "New run response:"
+          cat new_run.json
+
+          NEW_RUN_ID=$(jq -r '.run_id // empty' new_run.json)
+          if [ -z "$NEW_RUN_ID" ]; then
+            echo "Could not create follow-up run"; exit 1
+          fi
+          echo "new_run_id=$NEW_RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for follow-up 3-AI prompt (if created)
+        if: ${{ steps.fetch.outputs.fails != '0' }}
+        id: wait_new_prompt
+        env:
+          NEW_RUN_ID: ${{ steps.remediate.outputs.new_run_id }}
+        run: |
+          set -euo pipefail
+          ATTEMPTS=12
+          SLEEP=5
+          for i in $(seq 1 $ATTEMPTS); do
+            RESP="$(curl -sS "${SUPABASE_URL}/rest/v1/runs?id=eq.${NEW_RUN_ID}&select=final_prompt_markdown" \
+              -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
+              -H "Accept: application/json")"
+            PROMPT="$(echo "$RESP" | jq -r '.[0].final_prompt_markdown // empty')"
+            if [ -n "$PROMPT" ]; then
+              printf "%s\n" "$PROMPT" > lovable_prompt_next.md
+              echo "prompt_path=lovable_prompt_next.md" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Follow-up prompt not ready (attempt $i/12); sleeping ${SLEEP}s…"
+            sleep $SLEEP
+          done
+          echo "Timed out waiting for follow-up prompt"; exit 2
+
+      - name: Post next Lovable prompt (if created)
+        if: ${{ steps.fetch.outputs.fails != '0' }}
+        uses: actions/github-script@v7
+        env:
+          PROMPT_PATH: ${{ steps.wait_new_prompt.outputs.prompt_path }}
+          NEW_RUN_ID: ${{ steps.remediate.outputs.new_run_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const md = fs.readFileSync(process.env.PROMPT_PATH, 'utf8');
+            const lines = [];
+            lines.push(`🧭 **Next Lovable Prompt (auto-generated)** — Run ${process.env.NEW_RUN_ID}`);
+            lines.push('');
+            lines.push(md);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: lines.join('\n')
+            });
+
+      - name: Mark old run built or needs_revision in Supabase
+        env:
+          RUN_ID: ${{ steps.extract.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          STATUS=$([ "${{ steps.fetch.outputs.fails }}" = "0" ] && echo "built" || echo "needs_revision")
+          curl -sS -X POST "$ORCH_MARK_URL" \
+            -H "x-orch-admin: ${ORCH_ADMIN_SECRET}" \
+            -H "content-type: application/json" \
+            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            -d "{\"run_id\":\"${RUN_ID}\",\"status\":\"${STATUS}\"}" > /dev/null || true
+
+      - name: Final comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const hadFailures = "${{ steps.fetch.outputs.fails }}" !== "0";
+            const msg = hadFailures
+              ? "🔁 Tests found failures — I posted a **new Lovable prompt** with the recommended fixes. Use `/start-build` on this issue to proceed with the new run once you’re ready."
+              : "✅ All tests passed. You can archive this run or proceed to the next task.";
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: msg
+            });
