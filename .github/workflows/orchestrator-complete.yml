@@ -1,4 +1,4 @@
-name: Orchestrator Complete Trigger
+name: Orchestrator — Complete Build
 
 on:
   issue_comment:
@@ -11,18 +11,17 @@ permissions:
 env:
   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
   SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
-  SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-  ORCH_MARK_URL: ${{ secrets.ORCH_MARK_URL }}
-  ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
 
 jobs:
   complete:
+    # Only react to the exact /complete-build command
     if: startsWith(github.event.comment.body, '/complete-build')
     runs-on: ubuntu-latest
+
     steps:
-      - name: Debug comment body
+      - name: Debug — show raw comment
         env:
-          BODY: ${{ github.event.issue.body }}
+          BODY: ${{ github.event.comment.body }}
         run: |
           echo "=== RAW COMMENT BODY START ==="
           printf "%s\n" "$BODY"
@@ -34,105 +33,157 @@ jobs:
           BODY: ${{ github.event.issue.body }}
         run: |
           set -euo pipefail
-          CLEAN="$(printf '%s\n' "$BODY" | tr -d '\r' | sed 's/\*\*//g')"
-          RUN_ID="$(printf '%s\n' "$CLEAN" \
-            | grep -oE 'Run ID:[[:space:]]*[0-9a-fA-F-]{36}' \
-            | head -n1 \
-            | sed -E 's/.*Run ID:[[:space:]]*//')"
+          # Body looks like:
+          # **Run ID:** c9f272b3-1790-405e-8176-095ee9311339
+          RUN_ID=$(printf "%s" "$BODY" | sed -n 's/.*Run ID:\s*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
           if [ -z "$RUN_ID" ]; then
-            echo "No Run ID found in issue body"; exit 1
+            echo "No Run ID found in issue body"
+            exit 1
           fi
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch tests from Supabase
-        id: fetch_tests
+      - name: Pull run meta (objective + prompt)
+        id: runmeta
         env:
           RUN_ID: ${{ steps.extract.outputs.run_id }}
-          SUPABASE_URL: ${{ env.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE: ${{ env.SUPABASE_SERVICE_ROLE }}
         run: |
           set -euo pipefail
-          RESP="$(curl -sS "${SUPABASE_URL}/rest/v1/orch_tests?run_id=eq.${RUN_ID}&select=test_name,success,log,created_at" \
+          curl -sS "${SUPABASE_URL}/rest/v1/runs?id=eq.${RUN_ID}&select=objective,final_prompt_markdown,created_at" \
             -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
-            -H "Accept: application/json")"
-          echo "raw_tests=$RESP" >> "$GITHUB_OUTPUT"
+            -H "Accept: application/json" \
+            > run.json
 
-          COUNT="$(printf '%s\n' "$RESP" | jq 'length')"
-          PASSED="$(printf '%s\n' "$RESP" | jq '[ .[].success ] | all')"
+          OBJ=$(jq -r '.[0].objective // ""' run.json)
+          PROMPT_LEN=$(jq -r '([.[0].final_prompt_markdown] | map(tostring) | .[0] | length) // 0' run.json)
 
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "all_passed=$PASSED" >> "$GITHUB_OUTPUT"
+          echo "objective=$OBJ" >> "$GITHUB_OUTPUT"
+          echo "prompt_len=$PROMPT_LEN" >> "$GITHUB_OUTPUT"
 
-          # Build a one-line summary list
-          SUMMARY="$(printf '%s\n' "$RESP" \
-            | jq -r '[ .[] | "\(.test_name): " + (if .success then "OK" else "FAIL" end) ] | join(", ")')"
-          echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
-
-      - name: Decide outcome
-        id: decide
-        run: |
-          set -euo pipefail
-          COUNT="${{ steps.fetch_tests.outputs.count }}"
-          ALL="${{ steps.fetch_tests.outputs.all_passed }}"
-          if [ "$COUNT" = "0" ]; then
-            echo "verdict=none" >> "$GITHUB_OUTPUT"
-            echo "status_msg=⚠️ No tests recorded for this run yet." >> "$GITHUB_OUTPUT"
-          elif [ "$ALL" = "true" ]; then
-            echo "verdict=pass" >> "$GITHUB_OUTPUT"
-            echo "status_msg=✅ All tests passed." >> "$GITHUB_OUTPUT"
-          else
-            echo "verdict=fail" >> "$GITHUB_OUTPUT"
-            echo "status_msg=❌ Some tests failed." >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Comment summary back to the issue
-        uses: actions/github-script@v7
+      - name: Pull test results for this run
+        id: tests
         env:
           RUN_ID: ${{ steps.extract.outputs.run_id }}
-          COUNT: ${{ steps.fetch_tests.outputs.count }}
-          SUMMARY: ${{ steps.fetch_tests.outputs.summary }}
-          STATUS_MSG: ${{ steps.decide.outputs.status_msg }}
+        run: |
+          set -euo pipefail
+          curl -sS "${SUPABASE_URL}/rest/v1/orch_tests?run_id=eq.${RUN_ID}&select=test_name,success,log,created_at&order=created_at.asc" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
+            -H "Accept: application/json" \
+            > tests.json
+
+          TOTAL=$(jq 'length' tests.json)
+          PASSED=$(jq '[ .[] | select(.success == true) ] | length' tests.json)
+          FAILED=$(jq '[ .[] | select(.success == false) ] | length' tests.json)
+
+          echo "total=$TOTAL"   >> "$GITHUB_OUTPUT"
+          echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
+          echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
+
+      - name: Build summary markdown
+        id: summary
+        env:
+          RUN_ID: ${{ steps.extract.outputs.run_id }}
+          OBJ: ${{ steps.runmeta.outputs.objective }}
+          PROMPT_LEN: ${{ steps.runmeta.outputs.prompt_len }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### 🧪 Test summary for run ${RUN_ID}"
+            echo
+            echo "**Objective:** ${OBJ}"
+            echo
+            echo "- Prompt present: $([ "$PROMPT_LEN" -gt 0 ] && echo "✅ (len=${PROMPT_LEN})" || echo "❌")"
+            echo "- Total tests: $(jq 'length' tests.json) • Passed: $(jq '[ .[] | select(.success == true) ] | length' tests.json) • Failed: $(jq '[ .[] | select(.success == false) ] | length' tests.json)"
+            echo
+            if [ "$(jq 'length' tests.json)" -gt 0 ]; then
+              echo "| When (UTC) | Test | Success | Notes |"
+              echo "|---|---|:---:|---|"
+              jq -r '.[] | "| " + (.created_at // "") + " | " + (.test_name // "") + " | " + (if .success then "✅" else "❌" end) + " | " + ((.log // "" ) | gsub("[\r\n]"; " ") | .[0:240]) + " |"' tests.json
+              echo
+            else
+              echo "_No tests recorded for this run yet._"
+              echo
+            fi
+          } > summary.md
+
+      - name: Build recommendation for Lovable
+        id: rec
+        env:
+          RUN_ID: ${{ steps.extract.outputs.run_id }}
+          OBJ: ${{ steps.runmeta.outputs.objective }}
+        run: |
+          set -euo pipefail
+          FAILED=$(jq '[ .[] | select(.success == false) ] | length' tests.json)
+          if [ "$FAILED" -gt 0 ]; then
+            # Collect failing details
+            jq -r '.[] | select(.success==false) | "- " + (.test_name // "unknown") + ": " + ((.log // "") | gsub("[\r\n]"; " ") | .[0:280])' tests.json > fails.txt
+
+            cat > recommendation.md <<'REC'
+#### ✅ Orchestrator Recommendation (fix failing checks)
+
+**What was done:** Build completed and test suite executed. Some checks failed.
+
+**Suggested next step (Lovable may amend):**  
+Create a small PR to **fix the failing tests only** — do not expand scope.
+
+**Scope:**
+- Keep API contract of `/wallet-ensure-weth` unchanged.
+- Align error taxonomy and log keys if mismatched.
+- Add minimal guards where logs indicate missing headers/values/timeouts.
+
+**Failing checks (truncated logs):**
+REC
+            cat fails.txt >> recommendation.md
+            cat >> recommendation.md <<REC
+
+**Lovable decision rule:** You can follow this recommendation or propose a better minimal fix, but stay within the objective: _${OBJ}_.
+
+\`\`\`
+RECOMMENDED_NEXT_STEP_FOR_LOVABLE
+Objective: Fix failing checks for run ${RUN_ID}
+Context: The above failed tests/logs show exactly what to correct.
+Instructions:
+- Patch the smallest surface to make all listed checks green.
+- Commit and push; then comment /test on this issue.
+- If you disagree with the recommendation, reply with your proposed minimal fix and rationale.
+\`\`\`
+REC
+          else
+            cat > recommendation.md <<REC
+#### 🎯 Orchestrator Recommendation (next incremental task)
+
+**What was done:** Build completed and **all recorded tests passed**.
+
+**Suggested next step (Lovable may amend):**  
+**Task 5.2 — Permit2 Preflight Integration in BUY Path**
+
+**Goal:** Wire **wallet-ensure-weth** into the BUY preflight so that, when plan-only check returns \`wrap\`, the UI/engine can prompt for \`autoWrap\` or schedule it server-side.
+
+**Scope (keep it minimal):**
+- Read-only path (no on-chain) in normal operation.
+- Add a guarded call path that sets \`autoWrap=true\` only when policy allows.
+- Preserve existing error taxonomy and logging conventions.
+
+**Acceptance (high level):**
+- Preflight returns a clear “wrap-needed” signal when WETH < min.
+- No on-chain calls unless explicitly allowed by config.
+- Existing flows remain unaffected when WETH >= min.
+
+**Lovable decision rule:** You can follow this recommendation or propose a better adjacent next step that keeps momentum toward end-to-end BUY execution on Base.
+REC
+          fi
+
+      - name: Post summary + recommendation
+        uses: actions/github-script@v7
         with:
           script: |
-            const runId   = process.env.RUN_ID;
-            const count   = process.env.COUNT;
-            const summary = process.env.SUMMARY || '—';
-            const msg     = process.env.STATUS_MSG;
-
-            const body = [
-              `🧪 Test summary for run ${runId}`,
-              ``,
-              count === '0'
-                ? `No tests recorded for this run yet.`
-                : `Tests: ${summary}`,
-              ``,
-              `Status: ${msg}`
-            ].join('\n');
-
+            const fs = require('fs');
+            const summary = fs.readFileSync('summary.md', 'utf8');
+            const rec = fs.readFileSync('recommendation.md', 'utf8');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body
-            });
-
-      - name: Mark run status in Supabase
-        if: ${{ steps.decide.outputs.verdict != 'none' }}
-        env:
-          RUN_ID: ${{ steps.extract.outputs.run_id }}
-          VERDICT: ${{ steps.decide.outputs.verdict }}
-          ORCH_MARK_URL: ${{ env.ORCH_MARK_URL }}
-          ORCH_ADMIN_SECRET: ${{ env.ORCH_ADMIN_SECRET }}
-        run: |
-          set -euo pipefail
-          if [ "$VERDICT" = "pass" ]; then
-            STATUS="built"
-          else
-            STATUS="needs_revision"
-          fi
-          curl -sS -X POST "$ORCH_MARK_URL" \
-            -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
-            -H "content-type: application/json" \
-            -d "{\"run_id\":\"${RUN_ID}\",\"status\":\"${STATUS}\"}"
-
+              body: `${summary}\n${rec}`
+            })
