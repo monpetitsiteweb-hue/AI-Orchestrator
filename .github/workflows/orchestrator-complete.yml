@@ -141,25 +141,72 @@ jobs:
           set -euo pipefail
           FAILED=$(jq '[ .[] | select(.success == false) ] | length' tests.json)
           if [ "$FAILED" -gt 0 ]; then
-            jq -r '.[] | select(.success==false) | "- " + (.test_name // "unknown") + ": " + ((.log // "") | gsub("[\r\n]"; " ") | .[0:280])' tests.json > fails.txt
+            jq -r '.[] | select(.success==false) | "- " + (.test_name // "unknown") + ": " + ((.log // "") | gsub("[\r\n]"; " ") | .[0:200])' tests.json > fails.txt
 
-            cat > recommendation.md <<'EOF'
-#### ✅ Orchestrator Recommendation (fix failing checks)
+            {
+              echo "#### ✅ Orchestrator Recommendation (fix failing checks)"
+              echo
+              echo "**What was done:** Build completed and test suite executed. Some checks failed."
+              echo
+              echo "**Suggested next step (Lovable may amend):**"
+              echo "Create a small PR to fix the failing tests only — do not expand scope."
+              echo
+              echo "**Scope:**"
+              echo "- Keep API contract of /wallet-ensure-weth unchanged."
+              echo "- Align error taxonomy and log keys if mismatched."
+              echo "- Add minimal guards where logs indicate missing headers/values/timeouts."
+              echo
+              echo "**Failing checks (truncated logs):**"
+              cat fails.txt
+              echo
+              echo "**Lovable decision rule:** You can follow this recommendation or propose a better minimal fix, but stay within the objective: ${OBJ}."
+              echo
+              echo "RECOMMENDED_NEXT_STEP_FOR_LOVABLE"
+              echo "Objective: Fix failing checks for run ${RUN_ID}"
+              echo "Context: The failed tests/logs above show what to correct."
+              echo "Instructions:"
+              echo "- Patch the smallest surface to make all listed checks green."
+              echo "- Commit and push; then comment /test on this issue."
+              echo "- If you disagree with the recommendation, reply with your proposed minimal fix and rationale."
+            } > recommendation.md
 
-**What was done:** Build completed and test suite executed. Some checks failed.
+          else
+            {
+              echo "#### 🎯 Orchestrator Recommendation (next incremental task)"
+              echo
+              echo "**What was done:** Build completed and all recorded tests passed."
+              echo
+              echo "**Suggested next step (Lovable may amend):**"
+              echo "Task 5.2 — Permit2 Preflight Integration in BUY Path"
+              echo
+              echo "**Goal:** Wire wallet-ensure-weth into the BUY preflight so that, when plan-only check returns wrap, the UI/engine can prompt for autoWrap or schedule it server-side."
+              echo
+              echo "**Scope (keep it minimal):**"
+              echo "- Read-only path (no on-chain) in normal operation."
+              echo "- Add a guarded call path that sets autoWrap=true only when policy allows."
+              echo "- Preserve existing error taxonomy and logging conventions."
+              echo
+              echo "**Acceptance (high level):**"
+              echo "- Preflight returns a clear “wrap-needed” signal when WETH < min."
+              echo "- No on-chain calls unless explicitly allowed by config."
+              echo "- Existing flows remain unaffected when WETH >= min."
+              echo
+              echo "**Lovable decision rule:** You can follow this recommendation or propose a better adjacent next step that keeps momentum toward end-to-end BUY execution on Base."
+            } > recommendation.md
+          fi
+          echo "Built recommendation.md"
 
-**Suggested next step (Lovable may amend):**
-Create a small PR to **fix the failing tests only** — do not expand scope.
-
-**Scope:**
-- Keep API contract of `/wallet-ensure-weth` unchanged.
-- Align error taxonomy and log keys if mismatched.
-- Add minimal guards where logs indicate missing headers/values/timeouts.
-
-**Failing checks (truncated logs):**
-EOF
-            cat fails.txt >> recommendation.md
-            cat >> recommendation.md <<'EOF'
-
-**Lovable decision rule:** You can follow this recommendation or propose a better minimal fix, but stay within the objective: _${OBJ}_.
-
+      - name: Post summary + recommendation
+        if: steps.gate.outputs.match == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('summary.md', 'utf8');
+            const rec = fs.readFileSync('recommendation.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `${summary}\n\n${rec}`
+            })
