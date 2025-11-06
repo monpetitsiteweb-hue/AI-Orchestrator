@@ -141,75 +141,25 @@ jobs:
           set -euo pipefail
           FAILED=$(jq '[ .[] | select(.success == false) ] | length' tests.json)
           if [ "$FAILED" -gt 0 ]; then
-            # Build failing list
             jq -r '.[] | select(.success==false) | "- " + (.test_name // "unknown") + ": " + ((.log // "") | gsub("[\r\n]"; " ") | .[0:280])' tests.json > fails.txt
 
-            printf "%s\n" "#### ✅ Orchestrator Recommendation (fix failing checks)
-            
+            cat > recommendation.md <<'EOF'
+#### ✅ Orchestrator Recommendation (fix failing checks)
+
 **What was done:** Build completed and test suite executed. Some checks failed.
 
 **Suggested next step (Lovable may amend):**
 Create a small PR to **fix the failing tests only** — do not expand scope.
 
 **Scope:**
-- Keep API contract of \`/wallet-ensure-weth\` unchanged.
+- Keep API contract of `/wallet-ensure-weth` unchanged.
 - Align error taxonomy and log keys if mismatched.
 - Add minimal guards where logs indicate missing headers/values/timeouts.
 
 **Failing checks (truncated logs):**
-" > recommendation.md
-
+EOF
             cat fails.txt >> recommendation.md
-            printf "%s\n" "
+            cat >> recommendation.md <<'EOF'
 
 **Lovable decision rule:** You can follow this recommendation or propose a better minimal fix, but stay within the objective: _${OBJ}_.
 
-\`\`\`
-RECOMMENDED_NEXT_STEP_FOR_LOVABLE
-Objective: Fix failing checks for run ${RUN_ID}
-Context: The above failed tests/logs show exactly what to correct.
-Instructions:
-- Patch the smallest surface to make all listed checks green.
-- Commit and push; then comment /test on this issue.
-- If you disagree with the recommendation, reply with your proposed minimal fix and rationale.
-\`\`\`
-" >> recommendation.md
-          else
-            printf "%s\n" "#### 🎯 Orchestrator Recommendation (next incremental task)
-
-**What was done:** Build completed and **all recorded tests passed**.
-
-**Suggested next step (Lovable may amend):**
-**Task 5.2 — Permit2 Preflight Integration in BUY Path**
-
-**Goal:** Wire **wallet-ensure-weth** into the BUY preflight so that, when plan-only check returns \`wrap\`, the UI/engine can prompt for \`autoWrap\` or schedule it server-side.
-
-**Scope (keep it minimal):**
-- Read-only path (no on-chain) in normal operation.
-- Add a guarded call path that sets \`autoWrap=true\` only when policy allows.
-- Preserve existing error taxonomy and logging conventions.
-
-**Acceptance (high level):**
-- Preflight returns a clear “wrap-needed” signal when WETH < min.
-- No on-chain calls unless explicitly allowed by config.
-- Existing flows remain unaffected when WETH >= min.
-
-**Lovable decision rule:** You can follow this recommendation or propose a better adjacent next step that keeps momentum toward end-to-end BUY execution on Base.
-" > recommendation.md
-          fi
-          echo "Built recommendation.md"
-
-      - name: Post summary + recommendation
-        if: steps.gate.outputs.match == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const summary = fs.readFileSync('summary.md', 'utf8');
-            const rec = fs.readFileSync('recommendation.md', 'utf8');
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `${summary}\n${rec}`
-            })
