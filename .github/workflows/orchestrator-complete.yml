@@ -50,7 +50,8 @@ jobs:
           BODY: ${{ github.event.issue.body }}
         run: |
           set -euo pipefail
-          RUN_ID=$(printf "%s" "$BODY" | sed -n 's/.*Run ID:[[:space:]]*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
+          CLEAN="$(printf "%s" "$BODY" | tr -d '*\r')"
+          RUN_ID=$(printf "%s" "$CLEAN" | sed -n 's/.*Run ID:[[:space:]]*\([0-9a-fA-F-]\{36\}\).*/\1/p' | head -n1)
           if [ -z "$RUN_ID" ]; then
             echo "No Run ID found in issue body"
             exit 1
