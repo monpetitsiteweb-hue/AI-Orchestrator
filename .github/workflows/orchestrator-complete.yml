@@ -1,4 +1,4 @@
-name: Orchestrator — Complete Build
+name: Orchestrator - Complete Build
 
 on:
   issue_comment:
@@ -30,17 +30,18 @@ jobs:
           BODY: ${{ github.event.comment.body }}
         run: |
           set -euo pipefail
-          # Case-insensitive exact match (trim spaces)
-          T="$(printf "%s" "$BODY" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-          if printf "%s" "$T" | grep -qi '^/complete-build$'; then
+          TRIMMED="$(printf "%s" "$BODY" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+          if printf "%s" "$TRIMMED" | grep -qi '^/complete-build$'; then
             echo "match=true" >> "$GITHUB_OUTPUT"
             echo "Found EXACT /complete-build"
-            exit 0
+          else
+            echo "match=false" >> "$GITHUB_OUTPUT"
+            echo "No /complete-build; will exit after this step."
           fi
-          echo "match=false" >> "$GITHUB_OUTPUT"
-          echo "No /complete-build; exiting early."
-          # Exit 0 so workflow is visible but does nothing
-          exit 0
+
+      - name: Stop if not /complete-build
+        if: steps.gate.outputs.match != 'true'
+        run: echo "Skipping — comment was not /complete-build"
 
       - name: Extract run_id from issue body
         id: extract
@@ -49,8 +50,6 @@ jobs:
           BODY: ${{ github.event.issue.body }}
         run: |
           set -euo pipefail
-          # Issue body contains a line like:
-          # **Run ID:** 7c01abb1-522b-4ae2-8280-a91fe4d2314d
           RUN_ID=$(printf "%s" "$BODY" | sed -n 's/.*Run ID:[[:space:]]*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
           if [ -z "$RUN_ID" ]; then
             echo "No Run ID found in issue body"
@@ -72,9 +71,6 @@ jobs:
             -H "Accept: application/json" \
             > run.json
 
-          echo "Downloaded runs meta:"
-          cat run.json
-
           OBJ=$(jq -r '.[0].objective // ""' run.json)
           PROMPT_LEN=$(jq -r '(.[0].final_prompt_markdown // "") | length' run.json)
 
@@ -93,9 +89,6 @@ jobs:
             -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
             -H "Accept: application/json" \
             > tests.json
-
-          echo "Downloaded tests:"
-          cat tests.json
 
           TOTAL=$(jq 'length' tests.json)
           PASSED=$(jq '[ .[] | select(.success == true) ] | length' tests.json)
@@ -148,25 +141,26 @@ jobs:
           set -euo pipefail
           FAILED=$(jq '[ .[] | select(.success == false) ] | length' tests.json)
           if [ "$FAILED" -gt 0 ]; then
+            # Build failing list
             jq -r '.[] | select(.success==false) | "- " + (.test_name // "unknown") + ": " + ((.log // "") | gsub("[\r\n]"; " ") | .[0:280])' tests.json > fails.txt
 
-            cat > recommendation.md <<'REC'
-#### ✅ Orchestrator Recommendation (fix failing checks)
-
+            printf "%s\n" "#### ✅ Orchestrator Recommendation (fix failing checks)
+            
 **What was done:** Build completed and test suite executed. Some checks failed.
 
-**Suggested next step (Lovable may amend):**  
+**Suggested next step (Lovable may amend):**
 Create a small PR to **fix the failing tests only** — do not expand scope.
 
 **Scope:**
-- Keep API contract of `/wallet-ensure-weth` unchanged.
+- Keep API contract of \`/wallet-ensure-weth\` unchanged.
 - Align error taxonomy and log keys if mismatched.
 - Add minimal guards where logs indicate missing headers/values/timeouts.
 
 **Failing checks (truncated logs):**
-REC
+" > recommendation.md
+
             cat fails.txt >> recommendation.md
-            cat >> recommendation.md <<REC
+            printf "%s\n" "
 
 **Lovable decision rule:** You can follow this recommendation or propose a better minimal fix, but stay within the objective: _${OBJ}_.
 
@@ -179,14 +173,13 @@ Instructions:
 - Commit and push; then comment /test on this issue.
 - If you disagree with the recommendation, reply with your proposed minimal fix and rationale.
 \`\`\`
-REC
+" >> recommendation.md
           else
-            cat > recommendation.md <<REC
-#### 🎯 Orchestrator Recommendation (next incremental task)
+            printf "%s\n" "#### 🎯 Orchestrator Recommendation (next incremental task)
 
 **What was done:** Build completed and **all recorded tests passed**.
 
-**Suggested next step (Lovable may amend):**  
+**Suggested next step (Lovable may amend):**
 **Task 5.2 — Permit2 Preflight Integration in BUY Path**
 
 **Goal:** Wire **wallet-ensure-weth** into the BUY preflight so that, when plan-only check returns \`wrap\`, the UI/engine can prompt for \`autoWrap\` or schedule it server-side.
@@ -202,7 +195,7 @@ REC
 - Existing flows remain unaffected when WETH >= min.
 
 **Lovable decision rule:** You can follow this recommendation or propose a better adjacent next step that keeps momentum toward end-to-end BUY execution on Base.
-REC
+" > recommendation.md
           fi
           echo "Built recommendation.md"
 
