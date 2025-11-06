@@ -14,10 +14,7 @@ env:
 
 jobs:
   complete:
-    # Only react to the exact /complete-build command
-    if: startsWith(github.event.comment.body, '/complete-build')
     runs-on: ubuntu-latest
-
     steps:
       - name: Debug — show raw comment
         env:
@@ -27,23 +24,44 @@ jobs:
           printf "%s\n" "$BODY"
           echo "=== RAW COMMENT BODY END ==="
 
+      - name: Gate — run only on /complete-build
+        id: gate
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          # Case-insensitive exact match (trim spaces)
+          T="$(printf "%s" "$BODY" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+          if printf "%s" "$T" | grep -qi '^/complete-build$'; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            echo "Found EXACT /complete-build"
+            exit 0
+          fi
+          echo "match=false" >> "$GITHUB_OUTPUT"
+          echo "No /complete-build; exiting early."
+          # Exit 0 so workflow is visible but does nothing
+          exit 0
+
       - name: Extract run_id from issue body
         id: extract
+        if: steps.gate.outputs.match == 'true'
         env:
           BODY: ${{ github.event.issue.body }}
         run: |
           set -euo pipefail
-          # Body looks like:
-          # **Run ID:** c9f272b3-1790-405e-8176-095ee9311339
-          RUN_ID=$(printf "%s" "$BODY" | sed -n 's/.*Run ID:\s*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
+          # Issue body contains a line like:
+          # **Run ID:** 7c01abb1-522b-4ae2-8280-a91fe4d2314d
+          RUN_ID=$(printf "%s" "$BODY" | sed -n 's/.*Run ID:[[:space:]]*\([0-9a-f-]\{36\}\).*/\1/p' | head -n1)
           if [ -z "$RUN_ID" ]; then
             echo "No Run ID found in issue body"
             exit 1
           fi
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Detected run_id=$RUN_ID"
 
       - name: Pull run meta (objective + prompt)
         id: runmeta
+        if: steps.gate.outputs.match == 'true'
         env:
           RUN_ID: ${{ steps.extract.outputs.run_id }}
         run: |
@@ -54,14 +72,18 @@ jobs:
             -H "Accept: application/json" \
             > run.json
 
+          echo "Downloaded runs meta:"
+          cat run.json
+
           OBJ=$(jq -r '.[0].objective // ""' run.json)
-          PROMPT_LEN=$(jq -r '([.[0].final_prompt_markdown] | map(tostring) | .[0] | length) // 0' run.json)
+          PROMPT_LEN=$(jq -r '(.[0].final_prompt_markdown // "") | length' run.json)
 
           echo "objective=$OBJ" >> "$GITHUB_OUTPUT"
           echo "prompt_len=$PROMPT_LEN" >> "$GITHUB_OUTPUT"
 
       - name: Pull test results for this run
         id: tests
+        if: steps.gate.outputs.match == 'true'
         env:
           RUN_ID: ${{ steps.extract.outputs.run_id }}
         run: |
@@ -71,6 +93,9 @@ jobs:
             -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE}" \
             -H "Accept: application/json" \
             > tests.json
+
+          echo "Downloaded tests:"
+          cat tests.json
 
           TOTAL=$(jq 'length' tests.json)
           PASSED=$(jq '[ .[] | select(.success == true) ] | length' tests.json)
@@ -82,6 +107,7 @@ jobs:
 
       - name: Build summary markdown
         id: summary
+        if: steps.gate.outputs.match == 'true'
         env:
           RUN_ID: ${{ steps.extract.outputs.run_id }}
           OBJ: ${{ steps.runmeta.outputs.objective }}
@@ -93,7 +119,11 @@ jobs:
             echo
             echo "**Objective:** ${OBJ}"
             echo
-            echo "- Prompt present: $([ "$PROMPT_LEN" -gt 0 ] && echo "✅ (len=${PROMPT_LEN})" || echo "❌")"
+            if [ "${PROMPT_LEN}" -gt 0 ]; then
+              echo "- Prompt present: ✅ (len=${PROMPT_LEN})"
+            else
+              echo "- Prompt present: ❌"
+            fi
             echo "- Total tests: $(jq 'length' tests.json) • Passed: $(jq '[ .[] | select(.success == true) ] | length' tests.json) • Failed: $(jq '[ .[] | select(.success == false) ] | length' tests.json)"
             echo
             if [ "$(jq 'length' tests.json)" -gt 0 ]; then
@@ -106,9 +136,11 @@ jobs:
               echo
             fi
           } > summary.md
+          echo "Built summary.md"
 
       - name: Build recommendation for Lovable
         id: rec
+        if: steps.gate.outputs.match == 'true'
         env:
           RUN_ID: ${{ steps.extract.outputs.run_id }}
           OBJ: ${{ steps.runmeta.outputs.objective }}
@@ -116,7 +148,6 @@ jobs:
           set -euo pipefail
           FAILED=$(jq '[ .[] | select(.success == false) ] | length' tests.json)
           if [ "$FAILED" -gt 0 ]; then
-            # Collect failing details
             jq -r '.[] | select(.success==false) | "- " + (.test_name // "unknown") + ": " + ((.log // "") | gsub("[\r\n]"; " ") | .[0:280])' tests.json > fails.txt
 
             cat > recommendation.md <<'REC'
@@ -173,8 +204,10 @@ REC
 **Lovable decision rule:** You can follow this recommendation or propose a better adjacent next step that keeps momentum toward end-to-end BUY execution on Base.
 REC
           fi
+          echo "Built recommendation.md"
 
       - name: Post summary + recommendation
+        if: steps.gate.outputs.match == 'true'
         uses: actions/github-script@v7
         with:
           script: |
