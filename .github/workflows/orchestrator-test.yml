@@ -1,44 +1,29 @@
-name: Orchestrator Test Runner
-
-on:
-  issue_comment:
-    types: [created]
-
-permissions:
-  contents: read
-  issues: write
-
 jobs:
   run_tests:
-    if: startsWith(github.event.comment.body, '/test')
     runs-on: ubuntu-latest
-
-    # ---- Make secrets available to all steps ----
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-      EXEC_BASE_URL: ${{ secrets.EXEC_BASE_URL }}         # e.g. https://<project>.supabase.co/functions/v1
-      ALLOW_WRAP: ${{ secrets.ALLOW_WRAP }}               # "true" to enable on-chain test; else skipped
-      BOT_ADDRESS: ${{ secrets.BOT_ADDRESS }}             # your Base taker/owner
+      EXEC_BASE_URL: ${{ secrets.EXEC_BASE_URL }}
+      BOT_ADDRESS: ${{ secrets.BOT_ADDRESS }}
+      ALLOW_WRAP: ${{ secrets.ALLOW_WRAP }}          # "true" to run submit path
+      RPC_URL_8453: ${{ secrets.RPC_URL_8453 }}      # ensure this is QuickNode
 
     steps:
-      - name: Extract run_id from issue body (robust)
+      - name: Extract run_id from issue body
         id: extract
-        env:
-          BODY: ${{ github.event.issue.body }}
+        shell: bash
         run: |
           set -euo pipefail
-          # Match "**Run ID:** <uuid>" or plain "Run ID: <uuid>"
-          RUN_ID=$(printf "%s\n" "$BODY" \
-            | sed -nE 's/.*[Rr]un[[:space:]]*ID[:*]*[[:space:]]*([0-9a-fA-F-]{36}).*/\1/p' \
-            | head -n1)
-          if [ -z "$RUN_ID" ]; then
-            echo "No Run ID found in issue body"; exit 1
-          fi
+          RUN_ID=$(printf "%s\n" "$BODY" | sed -nE 's/.*[Rr]un[[:space:]]*ID[:*]*[[:space:]]*([0-9a-fA-F-]{36}).*/\1/p' | head -n1)
+          if [ -z "$RUN_ID" ]; then echo "No Run ID found in issue body"; exit 1; fi
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+        env:
+          BODY: ${{ github.event.issue.body }}
 
-      - name: Check 3-AI merged prompt exists (runs.final_prompt_markdown)
+      - name: Check final_prompt_markdown present
         id: prompt
+        shell: bash
         run: |
           set -euo pipefail
           RESP="$(curl -sS "${SUPABASE_URL}/rest/v1/runs?id=eq.${{ steps.extract.outputs.run_id }}&select=final_prompt_markdown" \
@@ -48,109 +33,70 @@ jobs:
           LEN=$(echo "$RESP" | jq -r '.[0].final_prompt_markdown | length // 0')
           if [ "$LEN" -gt 0 ]; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
-            echo "len=$LEN" >> "$GITHUB_OUTPUT"
           else
             echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "len=0" >> "$GITHUB_OUTPUT"
           fi
+          echo "len=$LEN" >> "$GITHUB_OUTPUT"
 
-      - name: Plan-only test — POST /wallet-ensure-weth (autoWrap=false)
-        id: plan_only
-        if: ${{ env.EXEC_BASE_URL != '' }}
+      - name: Call /wallet-ensure-weth (plan-only)
+        id: plan
+        shell: bash
         run: |
           set -euo pipefail
-          BODY=$(jq -n --arg addr "0x0000000000000000000000000000000000000000" --arg min "0" --argjson wrap false \
-            '{address:$addr, minWethNeededWei:$min, autoWrap:$wrap}')
-
-          HTTP=$(curl -sS -w "%{http_code}" -o resp.json -X POST "${EXEC_BASE_URL}/wallet-ensure-weth" \
-            -H "content-type: application/json" \
+          # Always send Authorization to Edge Functions
+          RESP="$(curl -sS -X POST "${EXEC_BASE_URL}/wallet-ensure-weth" \
             -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
-            -d "$BODY")
-          echo "HTTP=$HTTP"
-          cat resp.json || true
+            -H "Content-Type: application/json" \
+            --data '{"action":"plan","owner":"'"${BOT_ADDRESS}"'","amountWei":"100000000000000"}' || true)"
+          OK=$(echo "$RESP" | jq -r '.ok // false')
+          MSG=$(echo "$RESP" | jq -r '.message // ""')
+          # Write multi-line safe output
+          echo "ok=$OK" >> "$GITHUB_OUTPUT"
+          {
+            echo 'msg<<EOF'
+            echo "$MSG"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
-          if [ "$HTTP" = "200" ]; then
-            OK=$(jq -r '.ok // false' resp.json)
-            ACTION=$(jq -r '.action // empty' resp.json)
-            if [ "$OK" = "true" ] && [ -n "$ACTION" ]; then
-              echo "ok=true" >> "$GITHUB_OUTPUT"
-              echo "action=$ACTION" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
-          echo "ok=false" >> "$GITHUB_OUTPUT"
-          MSG=$(jq -r '.error // .message // empty' resp.json)
-          echo "msg=${MSG}" >> "$GITHUB_OUTPUT"
-          exit 0
-
-      - name: Execute test — POST /wallet-ensure-weth (autoWrap=true)
-        id: exec_wrap
-        if: ${{ env.EXEC_BASE_URL != '' && env.ALLOW_WRAP == 'true' }}
+      - name: (Optional) Execute wrap submit when allowed
+        id: exec
+        if: env.ALLOW_WRAP == 'true'
+        shell: bash
         run: |
           set -euo pipefail
-          BODY=$(jq -n \
-            --arg addr "${BOT_ADDRESS}" \
-            --arg min  "1000000000000000" \
-            --argjson wrap true \
-            --argjson wait 10000 \
-            '{address:$addr, minWethNeededWei:$min, autoWrap:$wrap, maxWaitMs:$wait}')
-
-          HTTP=$(curl -sS -w "%{http_code}" -o resp.json -X POST "${EXEC_BASE_URL}/wallet-ensure-weth" \
-            -H "content-type: application/json" \
+          RESP="$(curl -sS -X POST "${EXEC_BASE_URL}/wallet-ensure-weth" \
             -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
-            -d "$BODY")
-          echo "HTTP=$HTTP"
-          cat resp.json || true
-
-          if [ "$HTTP" = "200" ]; then
-            OK=$(jq -r '.ok // false' resp.json)
-            TX=$(jq -r '.txHash // empty' resp.json)
-            if [ "$OK" = "true" ] && [ -n "$TX" ]; then
-              echo "ok=true" >> "$GITHUB_OUTPUT"
-              echo "tx=$TX" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
-          CODE=$(jq -r '.code // empty' resp.json)
-          MSG=$(jq -r '.error // .message // empty' resp.json)
-          echo "ok=false" >> "$GITHUB_OUTPUT"
+            -H "Content-Type: application/json" \
+            --data '{"action":"submit","owner":"'"${BOT_ADDRESS}"'","amountWei":"100000000000000"}' || true)"
+          OK=$(echo "$RESP" | jq -r '.ok // false')
+          CODE=$(echo "$RESP" | jq -r '.code // ""')
+          TX=$(echo "$RESP" | jq -r '.txHash // ""')
+          MSG=$(echo "$RESP" | jq -r '.message // ""')
+          echo "ok=$OK" >> "$GITHUB_OUTPUT"
           echo "code=$CODE" >> "$GITHUB_OUTPUT"
-          echo "msg=$MSG" >> "$GITHUB_OUTPUT"
-          exit 0
+          echo "tx=$TX" >> "$GITHUB_OUTPUT"
+          {
+            echo 'msg<<EOF'
+            echo "$MSG"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Report to Supabase (store test result row)
-        env:
-          TEST_API: ${{ secrets.ORCH_TEST_URL }}
-          ORCH_ADMIN_SECRET: ${{ secrets.ORCH_ADMIN_SECRET }}
-        run: |
-          set -euo pipefail
-          curl -sS -X POST "$TEST_API" \
-            -H "x-orch-admin: $ORCH_ADMIN_SECRET" \
-            -H "content-type: application/json" \
-            -d "$(jq -n \
-              --arg run_id "${{ steps.extract.outputs.run_id }}" \
-              --arg test_name "smoke" \
-              --argjson success $([ "${{ steps.plan_only.outputs.ok }}" = "true" ] && echo true || echo false) \
-              --arg log "plan_only=${{ steps.plan_only.outputs.ok }}; exec=${{ steps.exec_wrap.outputs.ok }}" \
-              '{run_id:$run_id,test_name:$test_name,success:$success,log:$log}')"
-
-      - name: Comment summary
+      - name: Post test summary
         uses: actions/github-script@v7
         with:
           script: |
-            const runId = "${{ steps.extract.outputs.run_id }}";
+            const runId   = "${{ steps.extract.outputs.run_id }}";
             const promptOk = "${{ steps.prompt.outputs.ok }}" === "true";
-            const promptLen = "${{ steps.prompt.outputs.len }}";
+            const promptLen= "${{ steps.prompt.outputs.len }}";
 
-            const planOk = "${{ steps.plan_only.outputs.ok }}" === "true";
-            const planMsg = "${{ steps.plan_only.outputs.msg || '' }}";
-            const planAct = "${{ steps.plan_only.outputs.action || '' }}";
+            const planOk   = "${{ steps.plan.outputs.ok }}" === "true";
+            const planMsg  = String.raw`${{ steps.plan.outputs.msg }}`;   // safe, not inline JSON
 
-            const execRan = process.env.ALLOW_WRAP === 'true';
-            const execOk = "${{ steps.exec_wrap.outputs.ok || '' }}" === "true";
-            const execTx = "${{ steps.exec_wrap.outputs.tx || '' }}";
-            const execCode = "${{ steps.exec_wrap.outputs.code || '' }}";
-            const execMsg = "${{ steps.exec_wrap.outputs.msg || '' }}";
+            const execRan  = process.env.ALLOW_WRAP === "true";
+            const execOk   = execRan ? ("${{ steps.exec.outputs.ok }}" === "true") : false;
+            const execTx   = execRan ? "${{ steps.exec.outputs.tx }}" : "";
+            const execCode = execRan ? "${{ steps.exec.outputs.code }}" : "";
+            const execMsg  = execRan ? String.raw`${{ steps.exec.outputs.msg }}` : "Set secret ALLOW_WRAP=true to enable on-chain wrap test";
 
             const lines = [];
             lines.push(`🧪 Test summary for run ${runId}`);
@@ -158,9 +104,9 @@ jobs:
             lines.push(`• Prompt present: ${promptOk ? "✅" : "❌"}`);
             lines.push(`↳ final_prompt_markdown present (len=${promptLen})`);
             lines.push(`• Plan-only /wallet-ensure-weth: ${planOk ? "✅" : "❌"}`);
-            lines.push(`↳ ${planOk ? `Plan-only OK (action=${planAct})` : (planMsg || "Plan-only failed")}`);
+            lines.push(`↳ ${planOk ? "Plan-only OK" : planMsg}`);
             lines.push(`• Execute /wallet-ensure-weth: ${execRan ? (execOk ? "✅" : "❌") : "⏭️"}`);
-            lines.push(`↳ ${execRan ? (execOk ? `Wrap tx: ${execTx}` : `code=${execCode} msg=${execMsg}`) : "Set secret ALLOW_WRAP=true to enable on-chain wrap test"}`);
+            lines.push(`↳ ${execRan ? (execOk ? `Wrap tx: ${execTx}` : `code=${execCode} msg=${execMsg}`) : execMsg}`);
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -168,3 +114,5 @@ jobs:
               issue_number: context.issue.number,
               body: lines.join("\n")
             });
+        env:
+          ALLOW_WRAP: ${{ env.ALLOW_WRAP }}
