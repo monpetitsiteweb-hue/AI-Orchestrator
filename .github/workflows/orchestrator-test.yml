@@ -1,3 +1,13 @@
+name: Orchestrator Test Runner
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   run_tests:
     runs-on: ubuntu-latest
