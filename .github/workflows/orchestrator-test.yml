@@ -57,7 +57,7 @@ jobs:
           RESP="$(curl -sS -X POST "${EXEC_BASE_URL}/wallet-ensure-weth" \
             -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
             -H "Content-Type: application/json" \
-            --data '{"action":"plan","owner":"'"${BOT_ADDRESS}"'","amountWei":"100000000000000"}' || true)"
+            --data '{"action":"plan","owner":"'"${BOT_ADDRESS}"'","minWethNeededWei":"100000000000000"}' || true)"
           OK=$(echo "$RESP" | jq -r '.ok // false')
           MSG=$(echo "$RESP" | jq -r '.message // ""')
           # Write multi-line safe output
@@ -77,7 +77,7 @@ jobs:
           RESP="$(curl -sS -X POST "${EXEC_BASE_URL}/wallet-ensure-weth" \
             -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
             -H "Content-Type: application/json" \
-            --data '{"action":"submit","owner":"'"${BOT_ADDRESS}"'","amountWei":"100000000000000"}' || true)"
+            --data '{"action":"submit","owner":"'"${BOT_ADDRESS}"'","minWethNeededWei":"100000000000000"}' || true)"
           OK=$(echo "$RESP" | jq -r '.ok // false')
           CODE=$(echo "$RESP" | jq -r '.code // ""')
           TX=$(echo "$RESP" | jq -r '.txHash // ""')
